@@ -1,0 +1,113 @@
+# Stage 2: Python services only. RabbitMQ arrives at stage 3, InfluxDB at
+# stage 10, Grafana at stage 12. Nothing here connects to anything yet -- the
+# stubs resolve configuration and exit.
+#
+# Every service is written out in full, with no YAML anchors. The four blocks
+# differ only in `command`, so the repetition is deliberate: nothing is hidden,
+# and a service that later needs its own environment or volumes just edits its
+# own block. The cost is that `image`, `env_file`, `volumes` and RABBITMQ_HOST
+# must be kept in sync by hand.
+
+# Pinned rather than inherited from the directory name. From stage 3 this
+# prefixes named volumes holding broker and database state, so a directory
+# rename must not be able to change it.
+name: thermo-warren
+
+services:
+  # ---------------------------------------------------------------- broker --
+  rabbitmq:
+    image: rabbitmq:4.3-management
+    # RabbitMQ derives its node name from the hostname (rabbit@rabbitmq) and
+    # stores data in a directory keyed by it. Left unset, Docker assigns a
+    # random hostname per container and a recreated broker cannot find its own
+    # data. Never change this value once a volume exists.
+    hostname: rabbitmq
+    environment:
+      # Interpolated from .env by Compose itself. These apply ONLY on first
+      # boot against an empty data directory -- editing them later has no
+      # effect until the volume is destroyed.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST}
+    ports:
+      # Loopback only. The ESP32 needs 1883 reachable from the LAN, so this
+      # widens to 0.0.0.0 at stage 14 -- deliberately not before.
+      - "127.0.0.1:5672:5672"      # AMQP 0-9-1
+      - "127.0.0.1:1883:1883"      # MQTT
+      - "127.0.0.1:15672:15672"    # management HTTP API and UI
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # Fails until every configured listener accepts a TCP connection, which
+      # matters because the MQTT listener comes up after the node itself.
+      # Liveness only: it opens a socket, with no handshake and no auth.
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------- Python ---
+  # One-shot declarer. From stage 4 every publisher and consumer gains
+  # `depends_on: {topology: {condition: service_completed_successfully}}`.
+  topology:
+    build:
+      context: .
+    image: thermo-warren:dev
+    # Host-mode values, loaded wholesale...
+    env_file: .env
+    environment:
+      # ...then the container-network override. This one line is the entire
+      # difference between the two run modes.
+      RABBITMQ_HOST: rabbitmq
+    volumes:
+      # Source is bind-mounted, so an edit needs no rebuild. Note the tradeoff:
+      # a running container is then executing code that is not in the image.
+      - ./src:/app/src
+    restart: "no"
+    command: ["python", "-m", "telemetry.topology"]
+
+  publisher:
+    build:
+      context: .
+    image: thermo-warren:dev
+    env_file: .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    volumes:
+      - ./src:/app/src
+    restart: "no"
+    command: ["python", "-m", "telemetry.publisher"]
+
+  consumer-observe:
+    build:
+      context: .
+    image: thermo-warren:dev
+    env_file: .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    volumes:
+      - ./src:/app/src
+    restart: "no"
+    command: ["python", "-m", "telemetry.consumer_observe"]
+
+  consumer-store:
+    build:
+      context: .
+    image: thermo-warren:dev
+    env_file: .env
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    volumes:
+      - ./src:/app/src
+    restart: "no"
+    command: ["python", "-m", "telemetry.consumer_store"]
+
+volumes:
+  # Broker state: definitions, queue contents, the node's identity. Prefixed
+  # with the project name, hence pinning `name:` above. Destroying this volume
+  # is how RABBITMQ_DEFAULT_USER/PASS get re-applied.
+  rabbitmq-data:

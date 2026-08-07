@@ -1,0 +1,18 @@
+# Secrets -- never commit. .env.example carries the shape instead.
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Tooling
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+
+# pycharm
+.idea/
