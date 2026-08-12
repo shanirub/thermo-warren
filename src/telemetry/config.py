@@ -12,7 +12,15 @@ Resolution order (pydantic-settings default, highest priority first):
 Fields with no default are required. A missing one raises at import time rather
 than at connect time, so the failure names the variable instead of surfacing
 later as a confusing connection error.
+
+Scope note: this file holds what *differs between run modes* -- endpoints,
+credentials, and each process's own behaviour. Topology names and the queue
+arguments the broker enforces live in `topology_spec.py` instead, because they
+must be identical in every mode and a silent mismatch there produces no error
+anywhere. See that module's docstring for the rule.
 """
+
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -41,8 +49,19 @@ class Settings(BaseSettings):
     rabbitmq_password: str
     rabbitmq_vhost: str = "/"
 
+    # Retry is owned by the connecting module, not by pika -- see
+    # topology.connect(). The compose healthcheck is liveness only, and host
+    # mode has no healthcheck gate at all, so a bounded retry is worth having.
+    rabbitmq_connect_attempts: int = 5
+    rabbitmq_connect_retry_delay: float = 2.0
+
+    # --- This process's own behaviour --------------------------------------
+    # Literal rather than str: a typo'd level fails at startup naming the field,
+    # instead of surfacing later as a confusing logging error.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+
     # --- Later stages ------------------------------------------------------
-    # Topology names (exchange, queues, binding key)  -> stage 4
+    # Topology names and queue arguments              -> topology_spec.py
     # InfluxDB url / org / bucket / token             -> stage 10
     # Publisher rate and corruption controls          -> stage 5
 
@@ -64,6 +83,9 @@ class Settings(BaseSettings):
             f"  rabbitmq_password    = {'*' * 8 if self.rabbitmq_password else '(empty)'}",
             f"  rabbitmq_vhost       = {self.rabbitmq_vhost}",
             f"  amqp_url             = {self.amqp_url}",
+            f"  connect_attempts     = {self.rabbitmq_connect_attempts}",
+            f"  connect_retry_delay  = {self.rabbitmq_connect_retry_delay}s",
+            f"  log_level            = {self.log_level}",
         ]
         return "\n".join(lines)
 

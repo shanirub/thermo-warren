@@ -51,12 +51,18 @@ services:
     restart: unless-stopped
 
   # --------------------------------------------------------------- Python ---
-  # One-shot declarer. From stage 4 every publisher and consumer gains
-  # `depends_on: {topology: {condition: service_completed_successfully}}`.
+  # One-shot declarer. Runs to completion and exits; every other Python service
+  # waits on that exit status, which is what makes the ordering enforced rather
+  # than merely intended.
   topology:
     build:
       context: .
     image: thermo-warren:dev
+    depends_on:
+      rabbitmq:
+        # Liveness, not readiness: check_port_connectivity opens a socket with
+        # no handshake and no auth. topology.connect() retries to cover the gap.
+        condition: service_healthy
     # Host-mode values, loaded wholesale...
     env_file: .env
     environment:
@@ -74,6 +80,12 @@ services:
     build:
       context: .
     image: thermo-warren:dev
+    depends_on:
+      topology:
+        # Nothing publishes or consumes until the topology exists. A topic
+        # exchange with no matching binding discards silently, so this gate
+        # replaces discipline with enforcement.
+        condition: service_completed_successfully
     env_file: .env
     environment:
       RABBITMQ_HOST: rabbitmq
@@ -86,6 +98,12 @@ services:
     build:
       context: .
     image: thermo-warren:dev
+    depends_on:
+      topology:
+        # Nothing publishes or consumes until the topology exists. A topic
+        # exchange with no matching binding discards silently, so this gate
+        # replaces discipline with enforcement.
+        condition: service_completed_successfully
     env_file: .env
     environment:
       RABBITMQ_HOST: rabbitmq
@@ -98,6 +116,12 @@ services:
     build:
       context: .
     image: thermo-warren:dev
+    depends_on:
+      topology:
+        # Nothing publishes or consumes until the topology exists. A topic
+        # exchange with no matching binding discards silently, so this gate
+        # replaces discipline with enforcement.
+        condition: service_completed_successfully
     env_file: .env
     environment:
       RABBITMQ_HOST: rabbitmq
