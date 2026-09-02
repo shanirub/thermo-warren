@@ -91,7 +91,11 @@ services:
       RABBITMQ_HOST: rabbitmq
     volumes:
       - ./src:/app/src
-    restart: "no"
+    # Long-lived from stage 5 on, unlike topology above -- matches rabbitmq's
+    # own policy. Restarts on crash (e.g. EXIT_UNREACHABLE while the broker is
+    # still starting) and on daemon restart, but not after a deliberate
+    # `docker compose stop publisher`.
+    restart: unless-stopped
     command: ["python", "-m", "telemetry.publisher"]
 
   consumer-observe:

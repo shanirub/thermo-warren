@@ -3,15 +3,15 @@
 Learning project. The target is message broker mechanics — exchanges, queues,
 bindings, acknowledgment, dead-lettering. The staged plan is the working document.
 
-Current stage: **4 — topology declared in code as a one-shot job.**
-`topology.py` is real. The publisher and both consumers are still stubs that
-resolve configuration and exit.
+Current stage: **5 — software publisher (verified).**
+`topology.py` and `publisher.py` are real. Both consumers are still stubs
+that resolve configuration and exit.
 
 ## Setup
 
 ```bash
 cp .env.example .env      # then edit the password
-uv lock                   # pyproject changed at stage 4 (pika, pytest)
+uv lock                   # pyproject changed at stage 5 (paho-mqtt)
 uv sync                   # creates .venv/ and installs the project editable
 ```
 
@@ -36,6 +36,129 @@ docker compose run --rm publisher
 Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
+
+## Stage 5 verification
+
+```bash
+docker compose build                                 # pyproject changed (paho-mqtt);
+                                                       # `up` alone reuses the stale image
+docker compose up -d rabbitmq
+docker compose ps                                    # wait for (healthy)
+docker compose run --rm topology
+```
+
+### Steady publishing
+
+```bash
+docker compose up -d publisher
+docker compose logs -f publisher                      # ~1 line/second, seq incrementing
+```
+
+THE DEFINITION OF DONE. With no consumers running -- both `consumer_observe.py`
+and `consumer_store.py` are still stage-6 stubs that resolve configuration and
+exit -- both queues can only grow. Check within the first minute or so of
+`publisher` starting:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+# wait a few seconds
+docker compose exec rabbitmq rabbitmqctl list_queues name messages
+```
+
+`telemetry.store` and `telemetry.observe` should show the same depth each
+time, and that depth should have grown by roughly the number of seconds you
+waited. If they diverge before message 100, the fan-out from stage 4 broke; if
+neither grows, the publisher isn't connected -- check `docker compose logs
+publisher`.
+
+Leave it running longer and the lockstep ends on purpose:
+`telemetry.observe` was declared in stage 4 with `x-max-length: 100`, so once
+it fills it holds steady at 100 (`x-overflow: drop-head` evicts the oldest to
+make room for the newest) while `telemetry.store` keeps growing unbounded.
+That divergence is the stage 9 lesson arriving early, not a bug -- lockstep
+growth is only the invariant up to the cap.
+
+Then confirm the payload and delivery mode in the management UI at
+<http://localhost:15672>: **Queues → telemetry.store → Get Message(s)**. Set
+"Ack Mode" to a requeue option so inspecting a message doesn't consume it, then
+check:
+
+- **Payload** is well-formed JSON with exactly the five contract fields:
+  `seq`, `device`, `temp_c`, `humidity_pct`, `ts_ms`.
+- **Properties → delivery_mode** shows **`2` (persistent)** -- this is the
+  proof that QoS 1 mapped to a persistent AMQP message, not just a claim in a
+  comment.
+
+Stop the long-lived publisher before the next two experiments, so they don't
+collide with it over the same MQTT client ID:
+
+```bash
+docker compose stop publisher
+```
+
+### Burst mode
+
+Ignores the rate setting; publishes as fast as possible, waits for every
+PUBACK, then exits.
+
+```bash
+docker compose run --rm publisher python -m telemetry.publisher --burst 20
+```
+
+Check the depths again. `telemetry.store` should have grown by exactly 20.
+`telemetry.observe` grows by 20 too *only if* it was still under its 100-cap
+when the burst ran; if the steady-publishing step above already filled it,
+these 20 just evict the 20 oldest and it holds at 100 -- same cap behaviour as
+above, not a sign the burst under-delivered.
+
+### Corruption mode
+
+Combined with `--burst` here so the run is bounded rather than needing a
+manual Ctrl-C; `--corrupt-every` alone is meant for a long steady run once
+stage 7 exists to observe what happens to a malformed message.
+
+```bash
+docker compose run --rm publisher \
+  python -m telemetry.publisher --burst 20 --corrupt-every 5
+```
+
+`docker compose logs publisher` (or the run's own stdout) should show a
+`WARNING ... emitting malformed payload: seq=5` line for `seq=5, 10, 15, 20`
+and nothing else unusual for the rest. RabbitMQ does not parse the payload, so
+these land in both queues exactly like any other message -- the malformed
+bytes only become a problem for stage 7's consumer.
+
+Bring the long-lived publisher back if you want it running:
+
+```bash
+docker compose up -d publisher
+```
+
+Purge both queues afterwards, from the management UI or with
+`rabbitmqctl purge_queue`, so stage 6 starts from a known state:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl purge_queue telemetry.store
+docker compose exec rabbitmq rabbitmqctl purge_queue telemetry.observe
+```
+
+### Host mode
+
+```bash
+uv run python -m telemetry.publisher
+uv run python -m telemetry.publisher --burst 20
+uv run python -m telemetry.publisher --burst 20 --corrupt-every 5
+```
+
+### Tests
+
+```bash
+uv run pytest
+```
+
+No broker needed. `build_payload`, `corrupt`, `should_corrupt` and
+`DriftSimulator` are pure functions, exercised the same way `declare()` is
+tested against a mock channel in stage 4 -- against no broker at all.
 
 ## Stage 4 verification
 

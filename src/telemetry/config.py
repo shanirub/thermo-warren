@@ -60,10 +60,27 @@ class Settings(BaseSettings):
     # instead of surfacing later as a confusing logging error.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
+    # --- Publisher (stage 5) ------------------------------------------------
+    # Same broker as above, connected to over MQTT instead of AMQP -- reuses
+    # rabbitmq_host, rabbitmq_mqtt_port, rabbitmq_user and rabbitmq_password.
+
+    # Stage 17's firmware must connect with a *different* client id: two MQTT
+    # clients sharing one id cause the broker to disconnect the first one, and
+    # the resulting flapping is hard to diagnose from the log alone.
+    mqtt_client_id: str = "telemetry-sim"
+
+    # The "device" field in the payload, and an InfluxDB tag from stage 11.
+    device_id: str = "sim-01"
+
+    # Steady-state publish rate. Corruption and burst are CLI flags instead of
+    # config fields -- they are hand-run experiments for stages 7 and 9, and a
+    # flag is unreachable from a normal `docker compose up` in a way a config
+    # field is not.
+    publish_interval_seconds: float = 1.0
+
     # --- Later stages ------------------------------------------------------
     # Topology names and queue arguments              -> topology_spec.py
     # InfluxDB url / org / bucket / token             -> stage 10
-    # Publisher rate and corruption controls          -> stage 5
 
     @property
     def amqp_url(self) -> str:
@@ -86,6 +103,9 @@ class Settings(BaseSettings):
             f"  connect_attempts     = {self.rabbitmq_connect_attempts}",
             f"  connect_retry_delay  = {self.rabbitmq_connect_retry_delay}s",
             f"  log_level            = {self.log_level}",
+            f"  mqtt_client_id       = {self.mqtt_client_id}",
+            f"  device_id            = {self.device_id}",
+            f"  publish_interval_s   = {self.publish_interval_seconds}",
         ]
         return "\n".join(lines)
 
