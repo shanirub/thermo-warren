@@ -1,0 +1,23 @@
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 5.5.5 Project Minimal Configuration
+#
+# Only deliberate, non-default choices belong here (see firmware/CLAUDE.md).
+# sdkconfig is generated from this file plus the target's own Kconfig
+# defaults, and is gitignored — this file is the committed source of truth.
+
+# Recorded by `idf.py set-target esp32c3` / `save-defconfig`. Committing it
+# means a fresh clone with no build/ directory and no IDF_TARGET env var
+# still resolves the right target (CMake's __target_init falls back to
+# reading CONFIG_IDF_TARGET from sdkconfig.defaults) — no manual
+# `idf.py set-target` step required before the first build.
+CONFIG_IDF_TARGET="esp32c3"
+
+# This board (ESP32-C3 Super Mini) has no USB-to-UART bridge chip; the
+# USB-C connector wires directly to the chip's internal USB Serial/JTAG
+# controller. Left at the default (UART0), build and flash both succeed
+# but idf.py monitor shows nothing, because nothing is driving UART0's pins
+# out over USB. This routes the console (stdout, ESP_LOG*, panic dumps)
+# over USB Serial/JTAG instead, which is what actually enumerates on the
+# host. See firmware/CLAUDE.md "The USB situation" for the full reasoning
+# and the manual-download-mode recovery procedure this implies.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

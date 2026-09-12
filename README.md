@@ -3,9 +3,12 @@
 Learning project. The target is message broker mechanics — exchanges, queues,
 bindings, acknowledgment, dead-lettering. The staged plan is the working document.
 
-Current stage: **5 — software publisher (verified).**
-`topology.py` and `publisher.py` are real. Both consumers are still stubs
-that resolve configuration and exit.
+Current stage: **14 — firmware toolchain and known-good flash (verified).**
+This is the hardware track's first stage, in `firmware/` — see
+`firmware/README.md` for its build/flash/verification steps. The software
+track is unchanged since stage 5 (verified): `topology.py` and
+`publisher.py` are real, both consumers are still stage-6 stubs that resolve
+configuration and exit.
 
 ## Setup
 
@@ -289,4 +292,4 @@ Nothing connects to a broker yet — RabbitMQ arrives at stage 3.
 | `rabbitmq/rabbitmq.conf` | broker config; unknown keys abort startup | 3 |
 | `rabbitmq/enabled_plugins` | management + MQTT; Erlang syntax, trailing period | 3 |
 | `grafana/` | provisioned datasource and dashboard | 12 |
-| `firmware/` | ESP-IDF project | 14 |
+| `firmware/` | ESP-IDF project (see `firmware/README.md`) | 14 |
