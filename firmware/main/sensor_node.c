@@ -1,9 +1,17 @@
 /*
  * Stage 15 — DHT11 sensor verification.
+ * Stage 15b — adds an SSD1306 OLED display of the current reading.
  *
- * Deliberately minimal: read the DHT11 on a fixed interval and log
- * temperature/humidity or the read error over USB Serial/JTAG. No Wi-Fi,
- * no MQTT, no persistence — that's stages 16-17.
+ * Deliberately minimal: read the DHT11 on a fixed interval, log
+ * temperature/humidity (or the read error) over USB Serial/JTAG, and show
+ * the latest reading on the OLED. No Wi-Fi, no MQTT, no persistence —
+ * that's stages 16-17.
+ *
+ * DHT read and OLED update run sequentially in this one task, never
+ * concurrently — required because the DHT driver holds a ~25 ms critical
+ * section per read (docs/dht-api.md) that nothing else on this single-core
+ * chip can run through. Hardware I2C (oled_display.c) tolerates that
+ * critical section fine when the two simply don't overlap in time.
  */
 #include <stdbool.h>
 
@@ -12,6 +20,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "oled_display.h"
 
 static const char *TAG = "dht11";
 
@@ -38,6 +47,10 @@ void app_main(void)
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
 
+    /* A dead/unresponsive OLED should fail loudly at startup rather than
+     * leave the loop silently skipping display updates (stage 15b DoD). */
+    ESP_ERROR_CHECK(oled_display_init());
+
     bool led_on = false;
 
     while (1) {
@@ -53,6 +66,11 @@ void app_main(void)
                                              &humidity, &temperature);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "temp_c=%.1f humidity_pct=%.1f", temperature, humidity);
+
+            esp_err_t oled_err = oled_show_readings(temperature, humidity);
+            if (oled_err != ESP_OK) {
+                ESP_LOGW(TAG, "oled update failed: %s", esp_err_to_name(oled_err));
+            }
         } else {
             ESP_LOGW(TAG, "read failed: %s", esp_err_to_name(err));
         }

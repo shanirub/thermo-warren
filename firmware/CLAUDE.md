@@ -7,8 +7,9 @@ stages 14 → 15 → 16 → 17. Nothing is thrown away between them.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Hardware track state: stage 14 done and verified.** Next is stage 15 (DHT11
-reads).
+**Hardware track state: stage 15b done and verified.** DHT11 reads and the
+SSD1306 OLED display both confirmed on hardware, running together without
+conflicts. Next is stage 16 (Wi-Fi).
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four
@@ -111,16 +112,15 @@ of unrelated-looking errors. Treat both as reserved.
 
 | Pins | Status |
 |---|---|
-| GPIO3 (SDA), GPIO10 (SCL) | **In use** — OLED, software I²C |
+| GPIO3 (SDA), GPIO10 (SCL) | **In use** — OLED, hardware I²C (I2C0) |
 | GPIO2, GPIO8, GPIO9 | **Avoid** — strapping; GPIO8 drives the LED, GPIO9 is BOOT |
 | GPIO18, GPIO19 | **Unavailable** — USB Serial/JTAG (not broken out anyway) |
 | GPIO20, GPIO21 | **Avoid** — UART0 |
 | GPIO12–17 | Not broken out — flash |
 | GPIO0, 1, 4 | Free, but ADC1 channels — prefer to keep |
 | GPIO5 | Free — ADC2 (unreliable with Wi-Fi active) |
-| **GPIO6, GPIO7** | **Free, no ADC function — preferred for DHT11 data** |
-
-DHT data pin not yet chosen; physical layout decides between 6 and 7.
+| GPIO7 | **In use** — DHT11 data |
+| GPIO6 | Free, no ADC function |
 
 ## DHT11 wiring (stage 1, verified)
 
@@ -152,12 +152,21 @@ reconnected again during stage 14's flash test without polarity being checked.
 matching stage 1 exactly. Polarity is correct and there is no rail-to-rail
 short.
 
-**Whether the die still responds is unknown until a read succeeds.** Resistance
-cannot show that. If stage 15's first reads fail, a dead sensor remains a live
-hypothesis alongside a driver or wiring mistake — do not assume a driver bug. A
-spare is on order.
+**Resolved at stage 15: the die responds, and the reading is genuinely live.**
+Reads succeed, return plausible values, and the plan's breathe test (humidity
+climbs then decays under breath) was run and passed — ruling out a stuck
+buffer or silently-accepted checksum failure. The spare that was on order is
+now a spare, not a required fallback.
 
-## Sensor driver (stage 15)
+## Sensor driver (stage 15, done)
+
+**Verified on hardware:** GPIO7, `dht_read_float_data(DHT_TYPE_DHT11, ...)`,
+5 s poll interval, plausible temp/humidity values logged on the sampling
+cadence over USB Serial/JTAG. The plan's specified check — breathe on the
+sensor, confirm humidity climbs then decays — was also run and passed,
+ruling out a stuck buffer or silently-accepted checksum failure. Both the
+"sensor health" open question (does the die respond) and the "proven live
+vs. plausible-looking constant" distinction are closed.
 
 `esp-idf-lib/dht`, a **registry component** rather than a vendored monorepo:
 
@@ -172,17 +181,78 @@ The three that shape the design:
 - **Each read holds a critical section for roughly 25 ms** (the 20 ms start
   pulse plus bit decoding, all inside `PORT_ENTER_CRITICAL`). A read is not a
   cheap call.
-- **The OLED cannot run concurrently.** It uses software (bit-banged) I²C, the C3
-  is single-core, and neither protocol tolerates preemption. Sequence them in one
-  task or guard both with a mutex, or expect intermittent unreproducible read
-  failures that look like bad wiring. Moving the OLED to hardware I²C is the
-  cleaner fix, worth considering at stage 15.
+- **The OLED must not run concurrently with a DHT read**, regardless of I2C
+  flavor — the C3 is single-core and the DHT driver's critical section blocks
+  everything. Moved to hardware I2C at stage 15b (see "OLED display" below);
+  the two are still sequenced in one task, never overlapped, and verified
+  together on hardware with no dropped reads.
 - **DHT11 readings are whole numbers** — the driver discards the fractional byte
   for this sensor type. Expect `24.0`, never `24.4`.
 
 Respect the DHT11's ~2 s minimum sampling interval; the driver does not enforce
 it. The 1 Hz publish loop should read a cached value, and a tick without a fresh
 sample is expected behaviour, not a bug.
+
+## OLED display (stage 15b, done)
+
+**Verified on hardware:** SSD1306 128x64, I2C0 (GPIO3 SDA / GPIO10 SCL,
+400kHz), updates once per DHT read (5s cadence) showing "Temp: X.X°C" /
+"Humidity: Y.Y%". Confirmed updating in real time against a changing
+humidity reading (breath test), with no dropped DHT reads while the display
+was active.
+
+**I2C peripheral: I2C0.** Nothing else in this project claims a hardware I2C
+bus, so there was no conflict to design around; I2C1 would have been an
+arbitrary choice.
+
+**Display driver: ESP-IDF's native `esp_lcd_panel_ssd1306`** (in the `esp_lcd`
+component, ships with the toolchain — no external dependency). This was not
+the original plan, and the actual path there is worth recording since it
+overturned two assumptions made from memory rather than from the installed
+source:
+
+- **`esp-idf-lib/ssd1306` does not exist.** The `esp-idf-lib` registry
+  namespace has no SSD1306 component at all — checked directly against the
+  registry, not assumed.
+- **`espressif/ssd1306`** (what `idf.py add-dependency "ssd1306"` resolves
+  to) **is upstream-deprecated** — its README says so outright, and its only
+  constructor is marked `deprecated` in the header. It also uses the
+  **legacy** `i2c_port_t` driver (`driver/i2c.h`), not the
+  `i2c_master_bus_handle_t` driver this stage is otherwise built on. Fetched
+  and read before rejecting it, not assumed from the name.
+- **U8g2 (hardware I2C via a vendored C-only build)** was evaluated third and
+  is a live option if a fuller-featured display library is ever needed, but
+  was dropped in favor of the option below to avoid a 40+ MB vendored font
+  source tree in the repo for two lines of text.
+- Landed on `esp_lcd_panel_ssd1306` instead: it's the driver Espressif's own
+  deprecation notice on `espressif/ssd1306` points to, it's already present
+  in the installed IDF (confirmed via `find` under `$IDF_PATH`), and its I2C
+  transport (`esp_lcd_new_panel_io_i2c`) genuinely takes
+  `i2c_master_bus_handle_t` (confirmed by reading
+  `esp_lcd_io_i2c.h`) — the correct driver generation for this stage.
+
+**Tradeoff accepted:** `esp_lcd_panel_ssd1306` is a raw bitmap panel with no
+font or text API. `firmware/main/oled_display.c` carries a small 5x7 bitmap
+font covering only the characters the two display lines use (digits, `:`,
+`.`, `%`, `°`, and the specific letters in "Temp"/"Humidity") — not full
+ASCII, deliberately, since nothing else needs it yet. The font table was
+generated from an ASCII-art grid via a one-off script rather than
+hand-transcribed, to keep the bit arithmetic out of the error-prone path;
+correctness of the actual glyph shapes was confirmed by reading the display,
+not by inspecting the byte values.
+
+**Update cadence: every DHT read**, not a separate timer — the two are
+already sequenced in the same loop iteration (read, then display), so a
+second timer would add a moving part for no benefit.
+
+**No GPIO conflicts.** GPIO3/GPIO10 were already reserved for the OLED
+before this stage (see GPIO map); moving from software to hardware I2C only
+changed which peripheral drives them, not the pins themselves.
+
+**Stage 16 (Wi-Fi) can proceed cleanly.** Nothing here touches GPIO18/19
+(USB) or claims a second I2C bus; the open question of whether the DHT
+driver's critical section disrupts Wi-Fi (see "API verification" below)
+remains exactly as before — unaffected by the display work.
 
 ## API verification
 
