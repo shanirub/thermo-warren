@@ -3,12 +3,16 @@
 Learning project. The target is message broker mechanics — exchanges, queues,
 bindings, acknowledgment, dead-lettering. The staged plan is the working document.
 
-Current stage: **14 — firmware toolchain and known-good flash (verified).**
-This is the hardware track's first stage, in `firmware/` — see
-`firmware/README.md` for its build/flash/verification steps. The software
-track is unchanged since stage 5 (verified): `topology.py` and
-`publisher.py` are real, both consumers are still stage-6 stubs that resolve
-configuration and exit.
+## Project Status
+
+| Track | Stage | Status |
+| --- | --- | --- |
+| Software | 5 | Publisher verified; both consumers are stage-6 stubs that resolve configuration and exit |
+| Hardware | 14 | Toolchain and known-good flash verified |
+
+The two tracks run in parallel and meet only at the payload contract. Hardware
+work lives in `firmware/` — see `firmware/README.md` for its build/flash/verification
+steps.
 
 ## Setup
 
