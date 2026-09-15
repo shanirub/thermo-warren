@@ -1,11 +1,13 @@
 /*
  * Stage 15 — DHT11 sensor verification.
  * Stage 15b — adds an SSD1306 OLED display of the current reading.
+ * Stage 16 — brings up Wi-Fi station mode before entering the sensor loop.
  *
- * Deliberately minimal: read the DHT11 on a fixed interval, log
- * temperature/humidity (or the read error) over USB Serial/JTAG, and show
- * the latest reading on the OLED. No Wi-Fi, no MQTT, no persistence —
- * that's stages 16-17.
+ * Read the DHT11 on a fixed interval, log temperature/humidity (or the read
+ * error) over USB Serial/JTAG, and show the latest reading on the OLED.
+ * Wi-Fi runs itself once started — association and reconnect are handled by
+ * wifi_station.c's own task and event handlers, not from this loop. No MQTT
+ * and no publishing yet; that's stage 17.
  *
  * DHT read and OLED update run sequentially in this one task, never
  * concurrently — required because the DHT driver holds a ~25 ms critical
@@ -20,7 +22,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 #include "oled_display.h"
+#include "wifi_station.h"
 
 static const char *TAG = "dht11";
 
@@ -50,6 +54,23 @@ void app_main(void)
     /* A dead/unresponsive OLED should fail loudly at startup rather than
      * leave the loop silently skipping display updates (stage 15b DoD). */
     ESP_ERROR_CHECK(oled_display_init());
+
+    /* esp_wifi stores PHY calibration data here (nvs_enable defaults on in
+     * WIFI_INIT_CONFIG_DEFAULT), and stage 16 also reads the Wi-Fi
+     * credentials from it. A partition too old or too full to mount is
+     * recoverable by erasing it — the credentials are re-flashed, not
+     * generated, so nothing unrecoverable is lost. */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "erasing NVS partition: %s", esp_err_to_name(nvs_err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
+    /* Unprovisioned credentials abort here rather than leaving a board that
+     * looks healthy on the OLED while silently never reaching the network. */
+    ESP_ERROR_CHECK(sensor_wifi_start());
 
     bool led_on = false;
 

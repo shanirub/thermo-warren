@@ -153,7 +153,9 @@ This is the **single interface between the software and hardware halves**. Stage
 - Publisher-stamped rather than consumer-stamped because arrival-time stamping
   smears the timeline during exactly the stage 8, 11 and 18 demonstrations those
   stages exist to produce. The cost — the ESP32 needing SNTP — is accepted and
-  lands at stage 16.
+  lands at stage 17, with the MQTT client that needs the timestamp. Stage 16's
+  DoD is link state only and never mentions time; an earlier note placed SNTP
+  at 16, which was a guess at placement rather than a DoD commitment.
 - MQTT 5 **Content Type property set to `application/json`**. Whether the plugin
   maps it through to AMQP `content_type` is **unverified**; nothing depends on it.
 

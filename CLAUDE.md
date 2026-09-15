@@ -17,10 +17,11 @@ stage"; a scalar marker cannot describe two tracks.**
 | Track | State |
 |---|---|
 | **Software** | **Stage 5** — software publisher, verified. Both consumers (`consumer_observe.py`, `consumer_store.py`) are still stage 2 stubs. |
-| **Hardware** | **Stage 15b** — DHT11 reads and SSD1306 OLED display, both verified together on hardware. |
+| **Hardware** | **Stage 16** — DHT11 reads, SSD1306 OLED display and Wi-Fi station mode with automatic reconnect, all verified together on hardware. |
 
-Next on each: stage 6 (both consumers, manual ack, bounded prefetch) and stage 16
-(Wi-Fi). Either can proceed without the other.
+Next on each: stage 6 (both consumers, manual ack, bounded prefetch) and stage 17
+(MQTT on the MCU, plus the SNTP its `ts_ms` field needs — moved from stage 16,
+whose DoD is link state only). Either can proceed without the other.
 
 ## Layout
 

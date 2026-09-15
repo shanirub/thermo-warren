@@ -8,11 +8,12 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 | Track | Stage | Status |
 | --- | --- | --- |
 | Software | 5 | Publisher verified; both consumers are stage-6 stubs that resolve configuration and exit |
-| Hardware | 14 | Toolchain and known-good flash verified |
+| Hardware | 16 | DHT11, SSD1306 OLED and Wi-Fi station mode with automatic reconnect, all verified on hardware |
 
 The two tracks run in parallel and meet only at the payload contract. Hardware
 work lives in `firmware/` — see `firmware/README.md` for its build/flash/verification
-steps.
+steps, including the two one-time steps a new board needs before it will join the
+network. They meet at stage 17, when the MCU replaces the software publisher.
 
 ## Setup
 
@@ -296,4 +297,4 @@ Nothing connects to a broker yet — RabbitMQ arrives at stage 3.
 | `rabbitmq/rabbitmq.conf` | broker config; unknown keys abort startup | 3 |
 | `rabbitmq/enabled_plugins` | management + MQTT; Erlang syntax, trailing period | 3 |
 | `grafana/` | provisioned datasource and dashboard | 12 |
-| `firmware/` | ESP-IDF project (see `firmware/README.md`) | 14 |
+| `firmware/` | ESP-IDF project (see `firmware/README.md`) | 14–16 |

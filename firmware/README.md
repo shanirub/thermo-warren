@@ -6,11 +6,21 @@ directly). See `../CLAUDE.md` for the overall project and `CLAUDE.md` (this
 directory) for decisions already settled in a planning session — toolchain,
 GPIO map, DHT11 wiring, the payload contract.
 
-Current stage: **14 — toolchain and known-good flash (verified).** A
-minimal `app_main` logs an incrementing counter roughly once a second, over
-USB Serial/JTAG, to prove the build/flash/monitor loop before any sensor,
-Wi-Fi or MQTT code is added. No DHT11 driver, no GPIO reference, no network
-stack yet — that's stages 15-17.
+Current stage: **16 — Wi-Fi station mode (verified).** `app_main` reads the
+DHT11 every 5 s, shows the reading on an SSD1306 OLED over hardware I²C, and
+joins Wi-Fi in station mode with automatic reconnect. Stages 14 (toolchain),
+15 (DHT11) and 15b (OLED) are verified too; MQTT and SNTP are stage 17.
+
+**Two things a new board needs before it will work — both one-time, and both
+easy to mistake for a firmware bug:**
+
+1. **Wi-Fi credentials provisioned into NVS**, or the board aborts at boot by
+   design — see [Wi-Fi credentials](#wi-fi-credentials) below.
+2. **Its MAC address added to the router's whitelist.** This network filters by
+   MAC, so a board swap breaks Wi-Fi until the new MAC is allowed. The symptom
+   is a disconnect with `reason=202`, which reads as "authentication failed" and
+   looks exactly like a wrong password. The MAC is in the boot log
+   (`wifi:mode : sta (xx:xx:...)`).
 
 ## Prerequisites
 
@@ -40,6 +50,43 @@ idf.py set-target esp32c3   # only needed once per fresh clone; sdkconfig.defaul
                              # on a clean checkout works without this step too
 idf.py build
 ```
+
+## Wi-Fi credentials
+
+**Required once per board.** From stage 16 onward the firmware refuses to
+start without them: `sensor_wifi_start()` returns an error and
+`ESP_ERROR_CHECK` aborts at boot, deliberately, so an unprovisioned board
+fails loudly instead of running offline while looking healthy on the OLED.
+
+Credentials live in the device's **NVS partition**, not in the source tree
+and not in the app binary. Nothing secret is ever committed, and a built
+`.bin` can be shared without leaking the network password.
+
+```bash
+cd firmware
+cp wifi_creds.csv.example wifi_creds.csv
+$EDITOR wifi_creds.csv        # fill in your SSID and password
+```
+
+`wifi_creds.csv` is gitignored, as is the `wifi_creds.bin` generated from
+it. Generate the NVS image and flash it to the `nvs` partition at `0x9000`
+(its offset and 24 KB size come from `partitions_singleapp.csv`):
+
+```bash
+python3 $IDF_PATH/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py \
+    generate wifi_creds.csv wifi_creds.bin 0x6000
+
+python -m esptool -p /dev/ttyACM0 write_flash 0x9000 wifi_creds.bin
+```
+
+This survives ordinary reflashing: `idf.py flash` writes only the
+bootloader (`0x0`), partition table (`0x8000`) and app (`0x10000`), so
+`0x9000` is left alone. You only need to repeat this after
+`idf.py erase-flash`, or to change networks.
+
+**NVS is not encrypted.** This keeps the password out of git and out of the
+binary, which is the point — but anyone with physical access to the board
+can read it back out of flash. It is not secure storage.
 
 ## Flash
 

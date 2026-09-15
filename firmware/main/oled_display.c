@@ -8,9 +8,11 @@
  * firmware/CLAUDE.md for the full account.
  *
  * esp_lcd_panel_ssd1306 is a raw bitmap panel — it has no font or text
- * API. The 5x7 font below covers only the characters this stage's two
- * display lines actually use ("Temp: X.X°C", "Humidity: Y.Y%"), not the
- * full ASCII set — deliberately, per the project's scope-discipline rule.
+ * API. The 5x7 font below covers only what the two reading lines use:
+ * digits, punctuation, and the specific letters in "Temp"/"Humidity".
+ * A full uppercase set and oled_show_lines() were added at stage 16 for
+ * the Wi-Fi bring-up diagnostic and are commented out rather than
+ * deleted — see the note at the font table.
  */
 #include "oled_display.h"
 
@@ -55,8 +57,9 @@ static const struct font_entry FONT[] = {
     { ' '        , { 0x00, 0x00, 0x00, 0x00, 0x00 } },
     { '.'        , { 0x00, 0x00, 0x60, 0x00, 0x00 } },
     { ':'        , { 0x00, 0x00, 0x36, 0x00, 0x00 } },
+    // { '-'        , { 0x08, 0x08, 0x08, 0x08, 0x08 } },
     { '%'        , { 0x61, 0x10, 0x08, 0x04, 0x43 } },
-    { (char)0xB0 , { 0x02, 0x05, 0x05, 0x02, 0x00 } }, /* degree sign */
+    { (char)0xB0 , { 0x02, 0x05, 0x05, 0x02, 0x00 } },
     { '0'        , { 0x3E, 0x51, 0x49, 0x45, 0x3E } },
     { '1'        , { 0x00, 0x42, 0x7F, 0x40, 0x00 } },
     { '2'        , { 0x42, 0x61, 0x51, 0x49, 0x46 } },
@@ -67,9 +70,44 @@ static const struct font_entry FONT[] = {
     { '7'        , { 0x01, 0x71, 0x09, 0x05, 0x03 } },
     { '8'        , { 0x36, 0x49, 0x49, 0x49, 0x36 } },
     { '9'        , { 0x06, 0x49, 0x49, 0x29, 0x1E } },
+    // --- stage 16 Wi-Fi bring-up diagnostic, commented out ------------------
+    // '-' and the uppercase set below were added so oled_show_lines() (also
+    // commented out, at the end of this file) could put scan results and
+    // connection state on the display: the board had to be carried to the
+    // router, where no serial console is reachable. The fault turned out to be
+    // a defective MCU, not the firmware. Kept rather than deleted in case the
+    // same diagnostic is needed again — uncomment these, oled_show_lines() and
+    // its declaration in oled_display.h together.
+    //
+    // 'C', 'H' and 'T' are deliberately NOT in this block: oled_show_readings()
+    // needs them for "Temp:" / "Humidity:" / "°C", so they stay live above.
+    // -----------------------------------------------------------------------
+    // { 'A'        , { 0x7E, 0x09, 0x09, 0x09, 0x7E } },
+    // { 'B'        , { 0x7F, 0x49, 0x49, 0x49, 0x36 } },
     { 'C'        , { 0x3E, 0x41, 0x41, 0x41, 0x22 } },
+    // { 'D'        , { 0x7F, 0x41, 0x41, 0x41, 0x3E } },
+    // { 'E'        , { 0x7F, 0x49, 0x49, 0x49, 0x41 } },
+    // { 'F'        , { 0x7F, 0x09, 0x09, 0x09, 0x01 } },
+    // { 'G'        , { 0x3E, 0x41, 0x41, 0x49, 0x3A } },
     { 'H'        , { 0x7F, 0x08, 0x08, 0x08, 0x7F } },
+    // { 'I'        , { 0x00, 0x41, 0x7F, 0x41, 0x00 } },
+    // { 'J'        , { 0x20, 0x40, 0x41, 0x3F, 0x01 } },
+    // { 'K'        , { 0x7F, 0x08, 0x14, 0x22, 0x41 } },
+    // { 'L'        , { 0x7F, 0x40, 0x40, 0x40, 0x40 } },
+    // { 'M'        , { 0x7F, 0x02, 0x0C, 0x02, 0x7F } },
+    // { 'N'        , { 0x7F, 0x02, 0x04, 0x08, 0x7F } },
+    // { 'O'        , { 0x3E, 0x41, 0x41, 0x41, 0x3E } },
+    // { 'P'        , { 0x7F, 0x09, 0x09, 0x09, 0x06 } },
+    // { 'Q'        , { 0x3E, 0x41, 0x51, 0x21, 0x5E } },
+    // { 'R'        , { 0x7F, 0x09, 0x19, 0x29, 0x46 } },
+    // { 'S'        , { 0x46, 0x49, 0x49, 0x49, 0x31 } },
     { 'T'        , { 0x01, 0x01, 0x7F, 0x01, 0x01 } },
+    // { 'U'        , { 0x3F, 0x40, 0x40, 0x40, 0x3F } },
+    // { 'V'        , { 0x1F, 0x20, 0x40, 0x20, 0x1F } },
+    // { 'W'        , { 0x7F, 0x20, 0x18, 0x20, 0x7F } },
+    // { 'X'        , { 0x63, 0x14, 0x08, 0x14, 0x63 } },
+    // { 'Y'        , { 0x03, 0x04, 0x78, 0x04, 0x03 } },
+    // { 'Z'        , { 0x61, 0x51, 0x49, 0x45, 0x43 } },
     { 'd'        , { 0x38, 0x44, 0x44, 0x44, 0x7F } },
     { 'e'        , { 0x3C, 0x4A, 0x4A, 0x4A, 0x2C } },
     { 'i'        , { 0x00, 0x44, 0x7D, 0x40, 0x00 } },
@@ -203,3 +241,22 @@ esp_err_t oled_show_readings(float temp_c, float humidity_pct)
 
     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, s_fb);
 }
+
+// Commented out with the uppercase font above — see the note there.
+//
+// esp_err_t oled_show_lines(const char *l1, const char *l2, const char *l3, const char *l4)
+// {
+//     memset(s_fb, 0, sizeof(s_fb));
+//
+//     /* Four 7px rows on a 14px pitch: fills the 64px height with a small top
+//      * margin and a blank row between lines. 21 characters fit per line at
+//      * the 6px advance. */
+//     const char *lines[4] = { l1, l2, l3, l4 };
+//     for (int i = 0; i < 4; i++) {
+//         if (lines[i] != NULL) {
+//             fb_draw_string(0, 2 + i * 14, lines[i]);
+//         }
+//     }
+//
+//     return esp_lcd_panel_draw_bitmap(s_panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, s_fb);
+// }

@@ -7,9 +7,10 @@ stages 14 → 15 → 16 → 17. Nothing is thrown away between them.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Hardware track state: stage 15b done and verified.** DHT11 reads and the
-SSD1306 OLED display both confirmed on hardware, running together without
-conflicts. Next is stage 16 (Wi-Fi).
+**Hardware track state: stage 16 done and verified.** DHT11 reads, SSD1306
+OLED display and Wi-Fi station mode with automatic reconnect, all confirmed
+on hardware running together. Next is stage 17 (MQTT, and the SNTP that its
+`ts_ms` field needs).
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four
@@ -249,10 +250,95 @@ second timer would add a moving part for no benefit.
 before this stage (see GPIO map); moving from software to hardware I2C only
 changed which peripheral drives them, not the pins themselves.
 
-**Stage 16 (Wi-Fi) can proceed cleanly.** Nothing here touches GPIO18/19
-(USB) or claims a second I2C bus; the open question of whether the DHT
-driver's critical section disrupts Wi-Fi (see "API verification" below)
-remains exactly as before — unaffected by the display work.
+**Stage 16 (Wi-Fi) proceeded cleanly**, as expected — nothing here touches
+GPIO18/19 (USB) or claims a second I2C bus. The open question of whether the
+DHT driver's critical section disrupts Wi-Fi is now **closed**; see "Wi-Fi"
+below.
+
+## Wi-Fi (stage 16, done)
+
+**Verified on hardware:** station mode, credentials read from NVS, associates
+with the AP, obtains a DHCP address, and reconnects automatically after an
+outage. Reconnect was confirmed by **disabling the AP's 2.4 GHz radio for
+~2 minutes, not by power-cycling the AP** — a faithful proxy from the station's
+point of view (beacons stop either way), but it leaves the router's DHCP server
+and lease table up, so fresh-lease acquisition after a real reboot is untested.
+The full sequence was observed: reason 200 on loss, reason 201 on each failed
+retry, backoff 1s → 2s → 4s → 8s → 16s → 30s with the cap holding across
+several attempts, then association and `got ip` with no manual reset. The 5 s
+sensor loop kept running throughout.
+
+**Credentials live in NVS** (namespace `wifi`, keys `ssid`/`password`), flashed
+as a separate image at `0x9000` — never in the source tree, never in the app
+binary. `idf.py flash` writes only `0x0`, `0x8000` and `0x10000`, so credentials
+survive ordinary reflashing; they need re-flashing only after `idf.py
+erase-flash` or a network change. Procedure is in `README.md`. **NVS is not
+encrypted** — this keeps the password out of git, not out of reach of anyone
+holding the board.
+
+**An unprovisioned board aborts at boot**, deliberately: `sensor_wifi_start()`
+returns `ESP_ERR_NVS_NOT_FOUND` and `ESP_ERROR_CHECK` panics, rather than
+leaving a board that looks healthy on the OLED while silently never reaching the
+network.
+
+**Reconnect runs in its own task** — not in the disconnect event handler, not on
+`esp_timer`. The handler executes on the default event-loop task, so sleeping
+there to back off would stall delivery of every other event on that loop.
+`esp_timer.h` asks for callbacks lasting "a few microseconds" dispatched from a
+single shared high-priority task, which `esp_wifi_connect()` is not. The handler
+notifies with `xTaskNotifyGive`; the task owns the backoff and the retry.
+
+**Backoff 1 s → 30 s, deliberately no attempt limit** — the DoD requires
+rejoining after an outage of unknown duration. `IP_EVENT_STA_GOT_IP` resets the
+delay to the floor so the next outage backs off from the bottom.
+
+**`sensor_wifi_*`, not `wifi_station_*`** — the latter collides at link time with
+a symbol inside Espressif's closed-source `libnet80211.a`, which defines its own
+`wifi_station_start()`.
+
+### Environment facts
+
+- **The router runs a MAC address whitelist.** Any board swap breaks Wi-Fi until
+  the new MCU's MAC is added, and the symptom looks nothing like an ACL problem.
+  The single most expensive fact in this file. The working board's MAC is
+  `10:00:3b:b1:f1:74`.
+- **Reason 202 (`WIFI_REASON_AUTH_FAIL`) means the AP actively rejected us**, not
+  that the password is wrong. Here it meant the MAC was not whitelisted.
+- **Reason 2 (`WIFI_REASON_AUTH_EXPIRE`) at low RSSI looks like a credentials
+  fault and is not** — it is the handshake timing out.
+- **One of the two ESP32-C3 Super Minis is defective on receive.** Whitelisted
+  and next to the router it still gave reason 2, and the stock IDF scan example
+  found no APs on it while the good board found nine. Label it physically.
+- RSSI is not a useful first suspect: −78 dBm associates and holds fine.
+- Reason codes are enumerated in
+  `components/esp_wifi/include/esp_wifi_types_generic.h`.
+
+**Debugging method that worked:** flashing the stock `$IDF_PATH/examples/wifi/scan`
+example unmodified. It removes all project code, credentials and peripherals from
+the question and answers "does this radio hear anything at all" on its own. Worth
+reaching for first next time, not fifth.
+
+### Known gaps — recorded, not fixed
+
+- **The default country config only scans channels 1–11.** `esp_wifi.h` documents
+  the default as `{.cc="01", .schan=1, .nchan=11, .policy=AUTO}` and nothing calls
+  `esp_wifi_set_country()`. This AP demonstrably auto-selects its channel — seen
+  on channel 3, and it came back on **channel 2** after the radio was cycled. If it
+  ever lands on channel 12 or 13, both legal and in use here, the node goes
+  permanently blind with reason 201 and no obvious cause — the exact symptom stage
+  16 spent a session chasing. Closing it means calling `esp_wifi_set_country()`,
+  which is a change rather than a stage 16 requirement.
+- **Worst-case reconnect latency is ~30 s plus connect time**, measured. At stage
+  17's 1 Hz publish rate that is up to ~30 s of readings with nowhere to go after
+  an outage. Input to whatever stage 17 decides about buffering.
+
+### The bring-up diagnostic, commented out
+
+`oled_show_lines()`, the uppercase font in `oled_display.c` and the declaration in
+`oled_display.h` were written so the OLED could report scan results and connection
+state while the board was carried to the router, where no serial console is
+reachable. Kept commented rather than deleted — uncomment all three together.
+`'C'`, `'H'` and `'T'` stay live because `oled_show_readings()` needs them.
 
 ## API verification
 
@@ -269,10 +355,12 @@ ESP-MQTT event handler. `MQTT_EVENT_PUBLISHED` is documented as carrying only th
 message id, but `mqtt_client.h` has a general `reason_code` field on the event —
 suggestive, not conclusive. Settle it by reading the installed header.
 
-**Also unverified, and worth watching:** whether the DHT driver's ~25 ms
-critical section disrupts Wi-Fi, which depends on timely interrupt service. Do
-not assume either way. If Wi-Fi misbehaves once reads are running, this is the
-first suspect.
+**Resolved at stage 16:** the DHT driver's ~25 ms critical section does **not**
+disrupt Wi-Fi. The 5 s sensor loop and the Wi-Fi stack ran together through
+association, a two-minute outage, a full backoff walk and reassociation, with
+no dropped reads and no Wi-Fi misbehaviour attributable to the critical
+section. This had been flagged as the first suspect for any Wi-Fi trouble; it
+was not the cause of any of stage 16's problems.
 
 ## The payload contract (stage 17)
 
@@ -294,7 +382,8 @@ Rationale for each field is in `src/telemetry/CLAUDE.md`.
 - `temp_c` / `humidity_pct` — floats, matching `dht_read_float_data()` so no
   conversion is needed. Note the driver's argument order is **humidity first**,
   the opposite of this field order.
-- `ts_ms` — epoch **milliseconds**, publisher-stamped (requires SNTP, stage 16)
+- `ts_ms` — epoch **milliseconds**, publisher-stamped (requires SNTP, **stage 17** —
+  moved there deliberately; stage 16's DoD is link state only)
 - MQTT topic `sensors/esp32c3/telemetry`, **QoS 1**, protocol version **5.0**
 - **Client ID must differ from the software publisher's**, or the broker
   disconnects one of the two
