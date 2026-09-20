@@ -21,3 +21,67 @@ CONFIG_IDF_TARGET="esp32c3"
 # host. See firmware/CLAUDE.md "The USB situation" for the full reasoning
 # and the manual-download-mode recovery procedure this implies.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- Stage 17: MQTT ---------------------------------------------------------
+
+# The payload contract specifies MQTT 5.0. This is not cosmetic: the symbol
+# gates lib/mqtt5_msg.c and mqtt5_client.c into the build at all
+# (esp-mqtt/CMakeLists.txt) and derives the internal MQTT_PROTOCOL_5 used
+# throughout mqtt_client.c. Left at the default the client speaks 3.1.1, which
+# has no error channel whatsoever -- the broker cannot report a publishing
+# error other than by closing the connection -- so the PUBACK reason code that
+# makes an unroutable publish observable would simply never arrive.
+CONFIG_MQTT_PROTOCOL_5=y
+
+# Make outbox deletions observable. Without this, MQTT_EVENT_DELETED is
+# compiled out and mqtt_delete_expired_messages() discards expired messages
+# with no event and no log line at all. This is the backstop layer of the
+# outage policy (see main/mqtt_publisher.c); the 60 s application gate should
+# always trip first, so an event here is information worth having rather than
+# routine. Standalone symbol -- it does not require MQTT_USE_CUSTOM_CONFIG.
+CONFIG_MQTT_REPORT_DELETED_MESSAGES=y
+
+# Required only to reach CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS below, which
+# depends on it. Enabling it is behaviour-neutral: every value it gates has an
+# identical fallback in esp-mqtt's lib/include/mqtt_config.h (buffer 1024,
+# task priority 5, stack 6144, poll timeout 1000 ms, event queue 1, expiry
+# 30000 ms), so nothing moves except what is set explicitly here.
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+
+# Outbox messages are discarded once they reach this age, connected or not.
+#
+# One hour, which is deliberately far larger than any outage this node is
+# expected to survive. This is a *memory backstop, not a data policy*: the
+# 60 s application gate in main/mqtt_publisher.c decides what is dropped, and
+# nothing the gate admitted should ever be discarded by the outbox.
+#
+# The reasoning is specific to this project. `telemetry.observe` already
+# carries x-max-length 100 with drop-head while `telemetry.store` is unbounded
+# with a DLX -- the broker is already the thing that drops, and the asymmetry
+# between those two fates is the stated lesson. A firmware that dropped its own
+# backlog would send both queues identically truncated data and the lesson
+# would disappear. Replayed points land at their correct historical times
+# because ts_ms is publisher-stamped, which is exactly the cost stage 5
+# accepted SNTP for.
+#
+# The earlier value of 120000 was chosen believing the 60 s gate would keep the
+# expiry from ever firing. It does not: each queued message's fuse runs from its
+# own enqueue, so a 139 s outage expired seq 38-66 while seq 67 survived by
+# 420 ms. The gate bounds the backlog's *count*, never its age.
+#
+# Coupling worth knowing: the same constant bounds how long an already
+# transmitted message waits for its PUBACK, so a lost PUBACK now lingers up to
+# an hour. Bounded in practice by outbox.limit at 16 KB (~100 messages).
+CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=3600000
+
+# Both default to y and both are unused: this project connects over plain TCP
+# to port 1883, and TLS on the MQTT listener is deliberately out of scope
+# (mcu-rabbitmq-staged-plan.md). Turning them off is worth 13,552 bytes of the
+# app partition, measured -- 0xf9060 -> 0xf5b70 -- which matters because that
+# partition is at 4% free. Disabling the SSL transport does not remove mbedtls
+# from the image; WPA2 still needs it.
+#
+# CONFIG_MQTT_TRANSPORT_WEBSOCKET_SECURE depends on both of these and so turns
+# off with them; it is not listed separately.
+CONFIG_MQTT_TRANSPORT_SSL=n
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n

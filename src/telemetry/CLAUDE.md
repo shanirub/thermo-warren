@@ -156,8 +156,10 @@ This is the **single interface between the software and hardware halves**. Stage
   lands at stage 17, with the MQTT client that needs the timestamp. Stage 16's
   DoD is link state only and never mentions time; an earlier note placed SNTP
   at 16, which was a guess at placement rather than a DoD commitment.
-- MQTT 5 **Content Type property set to `application/json`**. Whether the plugin
-  maps it through to AMQP `content_type` is **unverified**; nothing depends on it.
+- MQTT 5 **Content Type property set to `application/json`**. **Verified at
+  stage 17: the plugin does map it through** to AMQP `content_type` — observed on
+  a queued message from the MCU in the management API. Still nothing depends on
+  it.
 
 **Note for stage 17:** a real DHT11 through `esp-idf-lib/dht` yields whole
 numbers only (`24.0`, never `24.4`) — the driver discards the fractional byte for
@@ -264,8 +266,11 @@ produce the *same* symptom: a hole in the `seq` sequence.
   support ended 31 Jul 2026; 4.3 runs to 30 Nov 2026.
 - **Broker user via `RABBITMQ_DEFAULT_USER`/`PASS`**, not `definitions.json` —
   declarative definitions would collide with the topology-declared-by-code goal.
-- **Ports bound to 127.0.0.1 only.** 1883 widens to all interfaces at stage 14+,
-  when the ESP32 needs it, and deliberately not before.
+- **AMQP and management bound to 127.0.0.1; MQTT is not.** 1883 publishes on
+  `0.0.0.0` from stage 17, because the ESP32 reaches it over the LAN and no
+  narrower binding works. This exposes the `iot` user, which still carries the
+  `administrator` tag — the answer to that is the scoped application user in
+  "Open questions", not a bind address.
 - **`anonymous_login_user = none`** in `rabbitmq.conf`. `mqtt.allow_anonymous`
   was deliberately omitted — an unsupported key aborts boot, and the docs are
   ambiguous about whether it survives in 4.3.
@@ -276,6 +281,25 @@ produce the *same* symptom: a hole in the `seq` sequence.
   socket — liveness, not correctness.
 - `topology` stays one-shot permanently. `publisher` is long-lived
   (`restart: unless-stopped`) from stage 5.
+
+### Running the stack
+
+```
+docker compose build          # only after a pyproject.toml change -- see below
+docker compose up -d          # start everything, detached
+docker compose logs -f rabbitmq   # follow one service; Ctrl-C detaches the reader only
+```
+
+Stopping: **`docker compose stop`** keeps the containers, **`down`** removes them
+but keeps the named volume, **`down -v`** destroys `rabbitmq-data`. Keep `-v` for
+when it is meant — destroying that volume is the only way
+`RABBITMQ_DEFAULT_USER`/`PASS` get re-applied, since they apply solely on first
+boot against an empty data directory.
+
+**Expected steady state at stage 5**, so `ps -a` does not look alarming:
+`rabbitmq` Up (healthy) and `publisher` Up; `topology`, `consumer-observe` and
+`consumer-store` all **`Exited (0)`** — the one-shot and the two stage 2 stubs
+doing exactly what they should. Management UI at `http://localhost:15672`.
 
 ## Verified broker facts — do not re-search
 
@@ -368,17 +392,35 @@ superseded; the README explains the cap.
   tutorials. Done at stage 5 for `ReasonCode.is_failure`,
   `Properties.ContentType` and `wait_for_publish` timeout semantics. **Worth
   repeating for `pika` at stage 6.**
+- **`docker compose up` without `-d` ties the stack's lifetime to the terminal.**
+  Ctrl-C sends SIGTERM to every service and stops the lot — a graceful shutdown,
+  not a kill, so nothing is corrupted, but the stack is then down. `restart:
+  unless-stopped` does **not** bring it back, by design: that policy ignores an
+  explicit operator stop. To read logs without owning the lifecycle, use
+  `docker compose logs -f`.
+- **Do not use `docker compose up -d --wait` at stage 5 — it reports a false
+  failure.** Verified on Compose v5.5.1: it exits **1** with
+  `container thermo-warren-consumer-observe-1 exited (0)`, because `--wait` treats
+  any service leaving the running set as a failed wait, and the stage 2 consumer
+  stubs resolve config and exit 0 immediately. The run itself is correct — the
+  broker comes up healthy and the UI answers. `topology` exits too but does not
+  trip it, presumably because of its `service_completed_successfully` gate;
+  **that explanation is inferred, not verified.** **Revisit at stage 6:** once
+  both consumers are long-lived, `--wait` becomes the right readiness gate,
+  blocking until the broker is healthy and both consumers are actually consuming.
 
 ## Check first at stage 6
 
-**Were `telemetry.store` and `telemetry.observe` purged after stage 5
-verification?** Not confirmed.
+**Resolved: all three queues were observed empty at stage 17**, so stage 5's
+traffic — including the deliberately malformed messages from `--corrupt-every` —
+is gone. `consumer_store.py` will not meet a poison message on its first run
+before stage 7 has built the reject-and-dead-letter path.
 
-If not, `telemetry.store` still holds stage 5 traffic **including deliberately
-malformed messages** from the `--corrupt-every` runs. The new
-`consumer_store.py` will hit those on its first run — before stage 7 has built
-any reject-and-dead-letter path — and it will look like a consumer bug. **Purge
-both queues, or know they are there.**
+**But the MCU has been publishing since**, and it is well-formed traffic with
+`device=esp32c3-01`. Expect depth in both queues at stage 6, and note
+`telemetry.observe` will be sitting at its `x-max-length` cap of 100 while
+`telemetry.store` grows unbounded. Purge before measuring anything, or account
+for it.
 
 ## Open questions
 

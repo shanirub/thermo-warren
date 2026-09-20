@@ -17,11 +17,16 @@ stage"; a scalar marker cannot describe two tracks.**
 | Track | State |
 |---|---|
 | **Software** | **Stage 5** — software publisher, verified. Both consumers (`consumer_observe.py`, `consumer_store.py`) are still stage 2 stubs. |
-| **Hardware** | **Stage 16** — DHT11 reads, SSD1306 OLED display and Wi-Fi station mode with automatic reconnect, all verified together on hardware. |
+| **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
-Next on each: stage 6 (both consumers, manual ack, bounded prefetch) and stage 17
-(MQTT on the MCU, plus the SNTP its `ts_ms` field needs — moved from stage 16,
-whose DoD is link state only). Either can proceed without the other.
+**The two tracks have now met, and the parallelism ends here.** Hardware is done
+through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
+*both* halves, so it cannot start until software reaches stage 13. There is no
+independent hardware work left to schedule.
+
+Next: **stage 6** on the software track (both consumers, manual ack, bounded
+prefetch), then 7-13. Stage 17's own DoD gets its second half signed off when
+stage 13 lands — the MCU side is already proven and needs no rework for it.
 
 ## Layout
 

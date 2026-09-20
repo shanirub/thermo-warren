@@ -6,16 +6,23 @@ directly). See `../CLAUDE.md` for the overall project and `CLAUDE.md` (this
 directory) for decisions already settled in a planning session — toolchain,
 GPIO map, DHT11 wiring, the payload contract.
 
-Current stage: **16 — Wi-Fi station mode (verified).** `app_main` reads the
-DHT11 every 5 s, shows the reading on an SSD1306 OLED over hardware I²C, and
-joins Wi-Fi in station mode with automatic reconnect. Stages 14 (toolchain),
-15 (DHT11) and 15b (OLED) are verified too; MQTT and SNTP are stage 17.
+Current stage: **17 — MQTT publisher (verified).** `app_main` runs a 1 Hz loop:
+it reads the DHT11 every 5th tick, shows the reading and a Wi-Fi link icon on an
+SSD1306 OLED over hardware I²C, and publishes the cached reading to RabbitMQ over
+MQTT 5 at QoS 1 with an SNTP-stamped timestamp. Wi-Fi and MQTT both reconnect
+automatically, and an outage longer than 60 s stops publishing at source with
+every dropped reading named in the log. Stages 14 (toolchain), 15 (DHT11),
+15b (OLED) and 16 (Wi-Fi) are verified too.
+
+This is the whole hardware half of the plan. Stage 18 needs the software track as
+well — see `../CLAUDE.md`.
 
 **Two things a new board needs before it will work — both one-time, and both
 easy to mistake for a firmware bug:**
 
-1. **Wi-Fi credentials provisioned into NVS**, or the board aborts at boot by
-   design — see [Wi-Fi credentials](#wi-fi-credentials) below.
+1. **Credentials provisioned into NVS** — Wi-Fi, and from stage 17 the broker
+   too — or the board aborts at boot by design. See
+   [Provisioning](#provisioning) below.
 2. **Its MAC address added to the router's whitelist.** This network filters by
    MAC, so a board swap breaks Wi-Fi until the new MAC is allowed. The symptom
    is a disconnect with `reason=202`, which reads as "authentication failed" and
@@ -25,7 +32,13 @@ easy to mistake for a firmware bug:**
 ## Prerequisites
 
 - ESP-IDF v5.5.5, installed at `~/esp/esp-idf-v5.5.5`
-- Target **esp32c3**; board is an **ESP32-C3 Super Mini**
+- Target **esp32c3**; board is an **ESP32-C3 Super Mini**, rev v0.4, with **4 MB
+  embedded flash** (confirmed by `python -m esptool -p /dev/ttyACM0 flash_id`)
+
+Note the build currently declares `CONFIG_ESPTOOLPY_FLASHSIZE_2MB` and uses the
+stock single-app partition table, so the app gets 1 MB of that 4 MB and is at 4%
+free. See "App partition" in `CLAUDE.md` — changing it must keep `nvs` at
+`0x9000`, or provisioned credentials are lost.
 
 Every shell needs the environment sourced before `idf.py` works — it does
 not persist across shells:
@@ -51,7 +64,7 @@ idf.py set-target esp32c3   # only needed once per fresh clone; sdkconfig.defaul
 idf.py build
 ```
 
-## Wi-Fi credentials
+## Provisioning
 
 **Required once per board.** From stage 16 onward the firmware refuses to
 start without them: `sensor_wifi_start()` returns an error and
@@ -62,31 +75,45 @@ Credentials live in the device's **NVS partition**, not in the source tree
 and not in the app binary. Nothing secret is ever committed, and a built
 `.bin` can be shared without leaking the network password.
 
+Two namespaces, one file, one flash:
+
+| Namespace | Keys | Read by |
+|---|---|---|
+| `wifi` | `ssid`, `password` | `wifi_station.c` (stage 16) |
+| `mqtt` | `host`, `port`, `user`, `password` | the MQTT client (stage 17) |
+
+The broker `host` is the **LAN address of the machine running docker
+compose** — not `localhost`, and not a compose service name. `compose.yaml`
+publishes 1883 on all interfaces for exactly this reason. `user` and
+`password` must match `RABBITMQ_USER` / `RABBITMQ_PASSWORD` in the repo-root
+`.env`; MQTT has no anonymous login on this broker.
+
 ```bash
 cd firmware
-cp wifi_creds.csv.example wifi_creds.csv
-$EDITOR wifi_creds.csv        # fill in your SSID and password
+cp provisioning.csv.example provisioning.csv
+$EDITOR provisioning.csv      # fill in both namespaces
 ```
 
-`wifi_creds.csv` is gitignored, as is the `wifi_creds.bin` generated from
-it. Generate the NVS image and flash it to the `nvs` partition at `0x9000`
+`provisioning.csv` is gitignored, as is the `provisioning.bin` generated
+from it. Generate the NVS image and flash it to the `nvs` partition at `0x9000`
 (its offset and 24 KB size come from `partitions_singleapp.csv`):
 
 ```bash
 python3 $IDF_PATH/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py \
-    generate wifi_creds.csv wifi_creds.bin 0x6000
+    generate provisioning.csv provisioning.bin 0x6000
 
-python -m esptool -p /dev/ttyACM0 write_flash 0x9000 wifi_creds.bin
+python -m esptool -p /dev/ttyACM0 write_flash 0x9000 provisioning.bin
 ```
 
 This survives ordinary reflashing: `idf.py flash` writes only the
 bootloader (`0x0`), partition table (`0x8000`) and app (`0x10000`), so
 `0x9000` is left alone. You only need to repeat this after
-`idf.py erase-flash`, or to change networks.
+`idf.py erase-flash`, to change networks, or when the broker host's LAN
+address changes.
 
-**NVS is not encrypted.** This keeps the password out of git and out of the
+**NVS is not encrypted.** This keeps the passwords out of git and out of the
 binary, which is the point — but anyone with physical access to the board
-can read it back out of flash. It is not secure storage.
+can read them back out of flash. It is not secure storage.
 
 ## Flash
 
@@ -105,6 +132,36 @@ It never exits on its own (quit is `Ctrl-]`).
 
 ```bash
 idf.py -p /dev/ttyACM0 monitor
+```
+
+### Monitoring to a log file
+
+`idf.py monitor` has `--timestamps` but **no option to save output** — it only
+passes a subset of flags through. Run the monitor module directly for that:
+
+```bash
+python -m esp_idf_monitor -p /dev/ttyACM0 --save-log build/sensor-node.elf
+```
+
+**`--save-log` is a boolean flag, not a filename.** It names the file itself,
+as `log.<elf-basename>.<YYYYMMDDHHMMSS>.txt` in the current directory — so the
+command above writes `log.sensor-node.20260917123810.txt` and prints the name on
+startup. `log.*.txt` is gitignored.
+
+Passing a filename after `--save-log` does not fail loudly: it is swallowed as
+the positional ELF argument instead, so address decoding silently points at a
+file that does not exist and panic backtraces stop resolving to function names.
+The `.elf` must be the only positional.
+
+Worth defaulting to this for anything that takes more than a few seconds to
+reproduce. Stage 17's outage test runs for minutes and the interesting lines —
+the gate tripping, the outbox expiring — are separated by long stretches of
+routine output that push them out of terminal scrollback. Reconstructing them
+from a partial copy-paste afterwards is not possible.
+
+```bash
+grep -c "outbox expiry dropped" run.log   # backstop drops
+grep -o 'seq=[0-9]*' run.log | uniq       # the seq series, holes and all
 ```
 
 ## Stage 14 verification

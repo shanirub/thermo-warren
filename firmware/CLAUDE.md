@@ -7,14 +7,40 @@ stages 14 → 15 → 16 → 17. Nothing is thrown away between them.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Hardware track state: stage 16 done and verified.** DHT11 reads, SSD1306
-OLED display and Wi-Fi station mode with automatic reconnect, all confirmed
-on hardware running together. Next is stage 17 (MQTT, and the SNTP that its
-`ts_ms` field needs).
+**Hardware track state: stage 17 publishing verified on hardware.**
+
+Verified: MQTT 5 over TCP to RabbitMQ, SNTP, 1 Hz publish of the cached DHT11
+reading at QoS 1, both queues filling from the MCU with the simulator stopped,
+payload matching the frozen contract, the 60 s offline gate behaving correctly
+through a ~250 s Wi-Fi outage, and network clients starting on
+`IP_EVENT_STA_GOT_IP`.
+
+Also verified: the `esp_mqtt_client_reconnect()` nudge on the recovery path
+(30 ms from address to broker, twice), the outbox expiry reporting its own drops,
+and both outage regimes — a 139 s outage losing a precisely located part of the
+buffer, a 23 s one losing nothing.
+
+The OLED link icon is confirmed by eye in both states.
+
+**Flashed, effect not yet verified:** the 1 h outbox fuse (the Option A policy
+change). Confirming it means one outage longer than 120 s showing **no**
+`outbox expiry dropped` lines at all — that is what produced 29 of them under the
+old 120 s fuse, so its absence is the test.
+
+Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
+reachable yet** — the software track is at stage 5, so there is no consumer, no
+InfluxDB and no dashboard. Sign that half off when the software track reaches
+stage 13; do not quietly redefine it.
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four
 behaviours that are not visible in the function signatures.
+
+See **`docs/mechanics.md`** for the three stage 17 diagrams: the per-message
+lifecycle (including the two counter-intuitive expiry transitions), the outage
+timeline (which is what refutes "the gate is below the expiry, so the expiry
+never fires"), and task ownership (which code runs on which task, and why the
+`msg_id`->`seq` map needs a mutex).
 
 ## Toolchain
 
@@ -52,6 +78,14 @@ so it would hang a tool call regardless.
 
 Expect the user to need an **unplug/replug cycle** before flash finds the port,
 because the USB Serial/JTAG port re-enumerates on reset.
+
+**Ask for a saved log, not a paste**, for anything that takes more than a few
+seconds to reproduce. Stage 17's outage test ran for minutes and the interesting
+lines were separated by stretches of routine output; the pasted excerpt omitted
+the window that would have settled whether the outbox expiry reported its drops,
+and it had to be established from `nm` on `libmqtt.a` instead. The invocation is
+in `README.md` — note that `--save-log` is a **boolean flag**, and a filename
+passed after it is silently swallowed as the ELF argument.
 
 ## Configuration: sdkconfig.defaults is the source of truth
 
@@ -202,6 +236,9 @@ sample is expected behaviour, not a bug.
 humidity reading (breath test), with no dropped DHT reads while the display
 was active.
 
+Stage 17 added a third argument, `bool link_up`, and a Wi-Fi link icon — see
+"OLED link icon" in the stage 17 section.
+
 **I2C peripheral: I2C0.** Nothing else in this project claims a hardware I2C
 bus, so there was no conflict to design around; I2C1 would have been an
 arbitrary choice.
@@ -350,10 +387,20 @@ substitute is grepping the installed source directly under `$IDF_PATH` or
 This matters at **stages 16–17**, where `esp_wifi_*` and `esp_mqtt_*` are large
 and version-sensitive.
 
-**Parked, unverified:** whether the MQTT 5 PUBACK **reason code** reaches the
-ESP-MQTT event handler. `MQTT_EVENT_PUBLISHED` is documented as carrying only the
-message id, but `mqtt_client.h` has a general `reason_code` field on the event —
-suggestive, not conclusive. Settle it by reading the installed header.
+**Resolved at stage 17 — and the earlier note here was wrong.** There is **no**
+general `reason_code` field on `esp_mqtt_event_t`; that field exists only for
+connect and disconnect, inside `esp_mqtt_error_codes_t`. `esp_mqtt5_event_property_t`
+carries no reason code either.
+
+The PUBACK reason code *is* reachable, by another route: `esp_mqtt5_parse_puback()`
+(`mqtt5_client.c:48`) points `event->data` at the reason-code byte with
+`data_len == 1` before `MQTT_EVENT_PUBLISHED` is dispatched. `data_len == 0`
+means the PUBACK omitted the code, which MQTT 5 permits and which means success.
+`mqtt_publisher.c` reads it this way.
+
+**The trap:** `MQTT_EVENT_PUBLISHED` is dispatched regardless of the code, and
+the code itself is only logged at `ESP_LOGD`. Without inspecting those bytes an
+unroutable publish is indistinguishable from a delivered one.
 
 **Resolved at stage 16:** the DHT driver's ~25 ms critical section does **not**
 disrupt Wi-Fi. The 5 s sensor loop and the Wi-Fi stack ran together through
@@ -361,6 +408,296 @@ association, a two-minute outage, a full backoff walk and reassociation, with
 no dropped reads and no Wi-Fi misbehaviour attributable to the critical
 section. This had been flagged as the first suspect for any Wi-Fi trouble; it
 was not the cause of any of stage 16's problems.
+
+## Stage 17 — MQTT publisher (verified on hardware)
+
+`mqtt_publisher.{c,h}` (client, offline gate, `msg_id`->`seq` map) and
+`time_sync.{c,h}` (SNTP). `sensor_node.c` now loops at **1 Hz**, reads the DHT
+every 5th tick into a cache, and publishes the cache every tick.
+
+**Still one task.** Stage 14 deferred "restructure into explicit tasks" to
+whichever stage first needed concurrency; stage 17 does not.
+`esp_mqtt_client_enqueue()` hands the network write to the MQTT client's own
+task, so a second application task would buy no parallelism on this single-core
+chip and would add a mutex around the cached reading for nothing.
+
+**`enqueue()`, never `publish()`.** `esp_mqtt_client_publish()` sends in the
+*calling* task and is documented as possibly blocking for several seconds
+(10 s network timeout), which would stall the DHT read and OLED update sharing
+this loop. `enqueue()` is the documented non-blocking form. `store=false` is
+correct — that flag only matters for QoS 0.
+
+**`seq` advances on every reading, including ones never sent.** A hole in the
+published series is therefore exactly the set of readings that were lost, and
+`grep -o 'seq=[0-9]*'` reads it off directly.
+
+### Credentials
+
+NVS namespace `mqtt`, keys `host` / `port` / `user` / `password`, read exactly
+as `wifi_station.c` reads namespace `wifi`. **`wifi_creds.csv` was renamed to
+`provisioning.csv`** — one file, one flash, two namespaces. `port` is `u16` so a
+malformed value fails in `nvs_get_u16` naming the key instead of becoming 0.
+
+Credentials are loaded in `sensor_mqtt_start()` at boot, **not** in the event
+handler, so an unprovisioned board still panics through `ESP_ERROR_CHECK` at
+startup rather than looking healthy until the first `GOT_IP`.
+
+`nvs_partition_gen` accepts `#` comment lines (it filters them before the
+`csv.DictReader`) and the `u16` encoding — both confirmed by generating an image,
+not assumed.
+
+### The outage policy, and where its reasoning was wrong
+
+ESP-MQTT's defaults lose data silently. Verified in the v5.5.5 source:
+
+- The outbox has **no message-count limit**. `outbox.limit` is a **byte** cap,
+  defaults to 0, and every enforcement site is gated on `> 0`.
+  `OUTBOX_MAX_SIZE (4*1024)` in `mqtt_config.h` is **dead code**, referenced
+  nowhere — a red herring if you go looking.
+- The real bound is a **per-message age**, default 30 s, swept every iteration
+  of the MQTT task loop whether connected or not, and swept *before* the resend
+  step — so a message can be dropped even though the link returned in that same
+  iteration.
+- That deletion is silent unless `MQTT_REPORT_DELETED_MESSAGES` is set.
+- On the `enqueue()` path the expiry clock is **never reset**: `outbox_set_tick()`
+  is called only in the `publish()` write path. A message therefore keeps its
+  original enqueue timestamp through transmission, and one near the edge can be
+  deleted *after the broker already has it* — a false "dropped" report. This is
+  why the application gate, not the expiry, is the trustworthy record.
+
+**Decided: the 60 s gate is the only bound that drops anything.** The outbox
+expiry is set to **1 h** and `outbox.limit` to **16 KB**, both deliberately far
+out of reach, so nothing the gate admitted is ever discarded by the outbox.
+
+The argument is specific to this project. `telemetry.observe` already carries
+`x-max-length: 100` with `drop-head` while `telemetry.store` is unbounded with a
+DLX — **the broker is already the thing that drops**, and the asymmetry between
+those two fates is the stated lesson. Delivering the whole backlog lets that
+asymmetry be watched on reconnect: observe sheds its head, store keeps
+everything. A firmware that dropped its own backlog would hand both queues
+identically truncated data and the lesson would vanish.
+
+Two smaller points also favour it. The gate cannot evict and the outbox is FIFO,
+so what survives is the **first** minute of the outage — which is *contiguous
+with the pre-outage series*, leaving no hole between what was delivered live and
+what arrived late. And one drop reason keeps `grep -o 'seq=[0-9]*'`
+interpretable: every hole is a gate decision, logged when it was made, with no
+false positives from the expiry's untrustworthy reporting.
+
+Replayed points land at their correct historical times because `ts_ms` is
+publisher-stamped — exactly the cost stage 5 accepted SNTP for.
+
+**The plan predicted the expiry would never fire because 60 s < 120 s. That was
+wrong**, and the layers are not nested. The gate bounds how *many* messages enter
+the outbox; the expiry bounds how *long* each one waits, timed from its own
+enqueue. Any outage longer than 120 s therefore expires part or all of the
+buffer regardless of where the gate sits. Buffering only ever rescues outages
+shorter than the fuse.
+
+**Measured over two outages in one run**, which between them cover both regimes:
+
+| | Duration | Gate drops | Expiry drops | Replayed |
+|---|---|---|---|---|
+| Outage 1 | 139 s | 79 (seq 106-184) | 29 (seq 38-66) | seq 67+ |
+| Outage 2 | 23 s | 0 | 0 | **all — zero loss** |
+
+The survival boundary landed exactly where "enqueue + 120 s vs reconnect at
+185.7 s" predicts, with under half a second of margin:
+
+```
+seq 65: queued 65059ms  fuse 185059ms  EXPIRED
+seq 66: queued 66099ms  fuse 186099ms  EXPIRED  (link already back up)
+seq 67: queued 67109ms  fuse 187109ms  acked @186689  <- survived by 420 ms
+```
+
+**seq 66 expired 430 ms *after* the link returned**, while queued behind the
+replay backlog — the `QUEUED -> expired` race against `QUEUED -> TRANSMITTED`
+actually happening, not just theoretically possible.
+
+Loss is never silent: 29 `outbox expiry dropped` lines were logged, so the
+reporting branch works (also confirmed statically — `nm` on `libmqtt.a` shows
+`outbox_delete_single_expired` is called and the silent `outbox_delete_expired`
+is never referenced).
+
+**This measurement is what the policy decision was made on, and it describes the
+old 120 s configuration.** Under the 1 h fuse the expected behaviour is: the gate
+admits ~60 readings, all of them are replayed on reconnect however long the
+outage lasted, and `outbox expiry dropped` never appears. That log line is now
+`ESP_LOGE` and reads "should not happen" — under the old fuse it fired
+routinely, which made it worthless as a signal.
+
+### The gate's clock starts late — an 8.4 s blind window
+
+Not anticipated, and a real limitation of keying the gate on MQTT session state.
+In outage 1 the last successful ack was **seq 37**, but the Wi-Fi driver only
+reported the loss at t=46.4 s (`reason=200`, beacon timeout, `bcn_timeout: 25000`
+in the driver log). For those ~8 s `s_connected` was still true, so:
+
+- the gate did not apply,
+- publishes logged as ordinary `queued seq=N` with no `(offline, within gate)`
+  marker — **the log looked healthy while nothing was reaching the broker**,
+- seq 38-45 were never acked and eventually expired out of the outbox.
+
+Those eight are also the `TRANSMITTED -> expired` transition observed in the
+wild: sent into a dead link, never acked, and deleted carrying their original
+enqueue timestamps.
+
+The gate's 60 s therefore runs from *when the driver notices*, not from when the
+link fails. Real worst case is ~60 s plus the beacon timeout.
+
+### enqueue() has three outcomes, logged separately
+
+| Return | Meaning | Who is dropped |
+|---|---|---|
+| `msg_id` | queued | — |
+| `-1` | MQTT 5 in-flight cap: unacked QoS>0 count above the broker's Receive Maximum | the **new** message |
+| `-2` | `outbox.limit` bytes exceeded | the **new** message |
+
+Note the asymmetry, which mirrors stage 9: the expiry discards the **oldest**,
+these two reject the **newest**. esp-mqtt defaults Receive Maximum to 65535 and
+lowers it only if CONNACK carries the property; RabbitMQ's MQTT plugin sets no
+such value, so `-1` is very unlikely here.
+
+Pre-CONNACK defaults are `max_qos = 2` and `receive_maximum = 65535`, which is
+why enqueueing works before the client has ever connected.
+
+### sdkconfig.defaults additions
+
+| Symbol | Value | Why |
+|---|---|---|
+| `CONFIG_MQTT_PROTOCOL_5` | `y` | Gates `mqtt5_client.c` into the build at all. Without it the client speaks 3.1.1, which has **no error channel** — the PUBACK reason code never arrives. |
+| `CONFIG_MQTT_REPORT_DELETED_MESSAGES` | `y` | Makes outbox expiry visible. Standalone symbol, no dependency on custom config. |
+| `CONFIG_MQTT_USE_CUSTOM_CONFIG` | `y` | Required only to reach the expiry timeout. |
+| `CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS` | `3600000` | Memory backstop, **not** a data policy — see the outage policy above. Was `120000`, which fired routinely. |
+| `CONFIG_MQTT_TRANSPORT_SSL` / `_WEBSOCKET` | `n` | Both unused; worth 13,552 bytes, measured. Does not remove mbedtls — WPA2 still needs it. |
+
+**Enabling `MQTT_USE_CUSTOM_CONFIG` is behaviour-neutral**: every value it gates
+has an identical fallback in `mqtt_config.h`. Confirmed after regeneration —
+buffer 1024, stack 6144, priority 5, poll 1000 ms, event queue 1, TCP port 1883
+all unchanged.
+
+Coupling worth knowing: the expiry constant also bounds how long an already
+transmitted message waits for its PUBACK.
+
+### Start both network clients on IP_EVENT_STA_GOT_IP
+
+Both SNTP and MQTT were originally started from `app_main`, before the
+interface had an address, and both paid a retry timeout for it:
+
+- **MQTT** burns a connect attempt into a dead route (`esp-tls: connect() error:
+  Host is unreachable` at t=389 ms) and then waits out its ~10 s reconnect timer.
+- **SNTP** is worse. lwIP waits a random 0–5 s before its first request
+  (`CONFIG_LWIP_SNTP_STARTUP_DELAY`, max 5000 ms here); if that request goes out
+  before there is a link it gets no reply, and `SNTP_RETRY_TIMEOUT` is 15 s,
+  **doubling** per failure to a 150 s cap.
+
+Measured cost: one boot synced 2.7 s after DHCP and lost 5 readings; another
+synced >14 s after and lost 21, purely on where the random startup delay landed.
+On outage recovery, DHCP completed at t=339919 ms and the broker was not reached
+until t=352899 ms — **13 s and 12 readings lost with the network already up.**
+
+Now: `time_sync_start()` and `sensor_mqtt_start()` validate configuration and
+register for `GOT_IP`; neither service starts until there is an address. Later
+`GOT_IP` events restart SNTP (its retry timer may have doubled out to 150 s) and
+call `esp_mqtt_client_reconnect()` (guarded on `!s_connected`). Both calls are
+non-blocking, so doing this on the default event-loop task does not violate
+stage 16's rule about never stalling that loop.
+
+Order still matters: `sensor_wifi_start()` creates the default event loop the
+other two register against.
+
+**Verified on hardware, and the improvement is large:**
+
+| | Before | After |
+|---|---|---|
+| DHCP -> broker connected | ~13,400 ms | **30 ms** (6299 -> 6329) |
+| DHCP -> clock set | up to ~14 s | **2.78 s** |
+| Readings lost at boot | 5 to 21 | **9, all waiting on SNTP** |
+
+The `esp-tls: connect() error` line is gone entirely, and `sntp started` /
+`mqtt client started (address acquired)` both land in the same millisecond as
+`got ip`. The remaining skipped `seq` are Wi-Fi association (`reason=2`, one
+retry) plus the SNTP round trip — no longer anything self-inflicted.
+
+**The reconnect nudge is verified too.** It fired twice in the outage run, and
+both times `got ip` -> `address reacquired, reconnecting now` -> `connected to
+broker` took **30 ms** (185639 -> 185669, and 221199 -> 221229), against the
+~13,000 ms this path cost before the change.
+
+### Include-order trap
+
+`mqtt5_client.h` and `mqtt_client.h` include each other, and with
+`CONFIG_MQTT_PROTOCOL_5=y` the latter pulls in the former itself. Including
+`mqtt5_client.h` first wins the include guard and leaves `mqtt_client.h`
+compiling against types it has not seen — `unknown type name
+'esp_mqtt5_event_property_t'`, which reads as a missing dependency rather than
+an ordering problem. **Include only `mqtt_client.h`.**
+
+### Measured on hardware
+
+- **Outbox replay is fast.** ~13 ms per message at RSSI -76 (11 messages in
+  140 ms), and ~10 ms per message at -75 during the outage run's replay of ~40
+  backlogged messages. The 1 s `MQTT_POLL_READ_TIMEOUT_MS` floor was the
+  suspected risk and is not reached: PUBACK traffic keeps the poll returning
+  early. At RSSI -83 the same acks took ~400 ms, so treat 10-13 ms as a best
+  case and ~400 ms as the degraded one.
+- **Replay does not save a message whose fuse expires mid-drain.** seq 66 died
+  430 ms into the replay. At 1 Hz production and ~100/s drain the backlog clears
+  in well under a second, so this only bites messages already at their fuse.
+- **RSSI varies a lot here** — -76, -83 and -87 across runs, and association at
+  -87 needed a retry (`reason=203`, `WIFI_REASON_ASSOC_FAIL`). Stage 16 recorded
+  -78 as fine; -87 is marginal.
+- The AP moved from **channel 3 to channel 2** across the outage, confirming the
+  recorded auto-select behaviour and the channel-12/13 risk in "Known gaps".
+- Boot `seq` values are permanently absent from the broker (clock not yet
+  synced). Expected, and visible as a leading gap.
+
+### Loop cadence
+
+`vTaskDelay` is relative, so the period is 1 s *plus* loop execution time and
+drifts slightly. Harmless: `ts_ms` is stamped per message, never inferred from
+cadence. `vTaskDelayUntil` would fix it if it ever matters. Recorded, not fixed.
+
+### OLED link icon (verified)
+
+**Verified on hardware in both states.** `oled_show_readings()` takes a
+`bool link_up` and draws a three-arc Wi-Fi fan in the top-right, struck through
+with a diagonal when the broker session is down.
+Driven by `sensor_mqtt_is_connected()` — MQTT state, not Wi-Fi state, since that
+is what decides whether readings reach the broker. Refresh is the 5 s read
+cadence, and only after a *successful* DHT read, so the marker goes stale if the
+sensor stops responding.
+
+A drawn icon rather than a word because the font covers only the characters
+"Temp"/"Humidity" need. The arcs are **generated** — a one-off script taking
+points within 0.6 px of radius 3, 6 and 9 from the apex inside a ~120 degree
+cone — and pasted in as an ASCII grid, the same approach and reasoning as the
+font table.
+
+Two things learned, both commented in `oled_display.c`:
+
+- **11x9 is too small.** A 1 px strike through 1 px arcs merges into the pattern
+  and reads as a smudge. Two attempts were discarded before 15x10.
+- **The strike needs a halo and two passes** — clear every halo pixel before
+  setting any line pixel. In one pass each point's halo erases the line pixel its
+  predecessor drew, leaving a dashed strike.
+
+### App partition is nearly full — and the chip has room
+
+`sensor-node.bin` is at **4% free** of the stock 1 MB app partition.
+
+**The chip is 4 MB, confirmed** by `esptool flash_id`: ESP32-C3 (QFN32) rev
+v0.4, "Embedded Flash 4MB (XMC)", manufacturer 46 device 4016, 40 MHz crystal.
+The build nevertheless sets `CONFIG_ESPTOOLPY_FLASHSIZE_2MB` and the stock
+single-app table gives the app 1 MB — so roughly 3 MB of the chip is unused.
+
+The fix is `CONFIG_ESPTOOLPY_FLASHSIZE_4MB` plus a custom partition table
+enlarging the `factory` app partition. **`nvs` must stay at offset `0x9000` at
+24 KB** or the provisioned Wi-Fi and broker credentials are lost and need
+re-flashing; the app partition starts at `0x10000` and only needs its *size*
+changed, so nothing below it has to move.
+
+**Still parked** as a change of its own, but no longer blocked on information.
 
 ## The payload contract (stage 17)
 
@@ -382,10 +719,24 @@ Rationale for each field is in `src/telemetry/CLAUDE.md`.
 - `temp_c` / `humidity_pct` — floats, matching `dht_read_float_data()` so no
   conversion is needed. Note the driver's argument order is **humidity first**,
   the opposite of this field order.
-- `ts_ms` — epoch **milliseconds**, publisher-stamped (requires SNTP, **stage 17** —
-  moved there deliberately; stage 16's DoD is link state only)
+- `ts_ms` — epoch **milliseconds**, publisher-stamped; needs SNTP, implemented at
+  stage 17 in `time_sync.c`
 - MQTT topic `sensors/esp32c3/telemetry`, **QoS 1**, protocol version **5.0**
 - **Client ID must differ from the software publisher's**, or the broker
-  disconnects one of the two
-- Port 1883 is bound to 127.0.0.1 only until stage 14's compose change widens it
-  for the ESP32 — check this before debugging a connection failure
+  disconnects one of the two. Implemented: client id `sensor-node-01`,
+  `device` field `esp32c3-01`, against the simulator's `telemetry-sim` / `sim-01`.
+- **Port 1883 now publishes on `0.0.0.0`** (`compose.yaml`), widened at stage 17
+  because the ESP32 needs it from the LAN. This exposes the `iot` user, which
+  still carries the `administrator` tag; the answer to that is a scoped
+  application user, not a bind address.
+
+**Verified against a real MCU message at stage 17:** same keys, same order, same
+types as `build_payload()`, `delivery_mode: 2` confirming QoS 1 became a
+persistent AMQP message, and routing key `sensors.esp32c3.telemetry`. Only
+`device` and the reading values differ. DHT11 whole numbers came through as
+`29.0` / `53.0` exactly as the driver's behaviour predicted.
+
+Also settled: the MQTT 5 **Content Type property does map through** to AMQP
+`content_type` (`application/json` observed on the queued message).
+`src/telemetry/CLAUDE.md` still records that as unverified — fix it there when
+the software track is next touched.

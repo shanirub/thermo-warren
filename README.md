@@ -7,13 +7,19 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 5 | Publisher verified; both consumers are stage-6 stubs that resolve configuration and exit |
-| Hardware | 16 | DHT11, SSD1306 OLED and Wi-Fi station mode with automatic reconnect, all verified on hardware |
+| Software | 5 | Publisher verified; both consumers are stage-2 stubs that resolve configuration and exit |
+| Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
-The two tracks run in parallel and meet only at the payload contract. Hardware
-work lives in `firmware/` — see `firmware/README.md` for its build/flash/verification
+The two tracks ran in parallel and met at the payload contract. Hardware work
+lives in `firmware/` — see `firmware/README.md` for its build/flash/verification
 steps, including the two one-time steps a new board needs before it will join the
-network. They meet at stage 17, when the MCU replaces the software publisher.
+network.
+
+**That meeting has happened:** the MCU publishes to both queues and its payload
+matches the contract exactly. What remains for stage 17's Definition of Done — a
+dashboard showing real room temperature — is blocked on the software track, which
+has to reach stage 13 first. Stage 18 needs both halves and so is the point where
+the tracks stop being independent.
 
 ## Setup
 

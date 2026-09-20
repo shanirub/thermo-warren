@@ -1,4 +1,0 @@
-key,type,encoding,value
-wifi,namespace,,
-ssid,data,string,YOUR_SSID_HERE
-password,data,string,YOUR_PASSWORD_HERE

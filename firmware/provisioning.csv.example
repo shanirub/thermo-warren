@@ -1,0 +1,25 @@
+# Host-side input to nvs_partition_gen.py -- see README.md "Provisioning".
+# Copy to provisioning.csv, fill in, generate the image, flash it once.
+# Both the filled-in CSV and the generated .bin are gitignored.
+#
+# Two namespaces, read by two modules: "wifi" by wifi_station.c (stage 16),
+# "mqtt" by the MQTT client (stage 17). One file and one flash provisions
+# both -- the alternative, build-time Kconfig, would put the broker password
+# in sdkconfig, which is gitignored and therefore not reproducible from a
+# fresh clone.
+key,type,encoding,value
+wifi,namespace,,
+ssid,data,string,YOUR_SSID_HERE
+password,data,string,YOUR_PASSWORD_HERE
+mqtt,namespace,,
+# The broker host is the machine running docker compose, reached over the
+# LAN -- not localhost, and not a container name. compose publishes 1883 on
+# all interfaces from stage 17 (see ../compose.yaml).
+host,data,string,192.168.1.100
+# u16 rather than string so a typo fails in nvs_get_u16 naming the key,
+# instead of silently becoming 0 in atoi.
+port,data,u16,1883
+# Must match RABBITMQ_USER / RABBITMQ_PASSWORD in the repo-root .env --
+# the broker rejects anything else, and MQTT has no anonymous login here.
+user,data,string,iot
+password,data,string,YOUR_BROKER_PASSWORD_HERE

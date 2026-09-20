@@ -30,10 +30,17 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
       RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST}
     ports:
-      # Loopback only. The ESP32 needs 1883 reachable from the LAN, so this
-      # widens to 0.0.0.0 at stage 14 -- deliberately not before.
+      # AMQP and management stay on loopback. MQTT is published on all
+      # interfaces from stage 17, because the ESP32 has to reach it from the
+      # LAN -- there is no narrower binding that still works, since pinning
+      # the host's own address only adds a machine-specific value that breaks
+      # on a DHCP lease change without reducing who can connect.
+      #
+      # Note this exposes the `iot` user, which currently carries the
+      # `administrator` tag. The answer to that is a scoped application user
+      # (deferred hardening, see src/telemetry/CLAUDE.md), not a bind address.
       - "127.0.0.1:5672:5672"      # AMQP 0-9-1
-      - "127.0.0.1:1883:1883"      # MQTT
+      - "0.0.0.0:1883:1883"        # MQTT -- LAN-reachable for the ESP32
       - "127.0.0.1:15672:15672"    # management HTTP API and UI
     volumes:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
