@@ -1,9 +1,10 @@
 """Durable-path consumer.
 
 Manual acknowledgment, bounded prefetch, dead-letter exchange attached. Parses
-and acknowledges from stage 6; the InfluxDB write is inserted between the parse
-and the acknowledgment at stage 11, and where exactly it goes is the whole
-lesson of that stage.
+and acknowledges from stage 6; rejects anything that fails the payload contract
+from stage 7, without requeueing, so it dead-letters through telemetry.dlx. The
+InfluxDB write is inserted between the parse and the acknowledgment at stage 11,
+and where exactly it goes is the whole lesson of that stage.
 
 Exit codes:
     0  clean exit (SIGTERM/SIGINT received)
@@ -21,42 +22,73 @@ import logging
 import sys
 import time
 
+from telemetry import payload as contract
 from telemetry import topology_spec as spec
 from telemetry.amqp import run_consumer
 from telemetry.config import settings
 from telemetry.logging_setup import configure_logging
+from telemetry.payload import FIELD_SEQ, ContractViolation
 
 log = logging.getLogger(__name__)
 
-FIELD_SEQ = "seq"
 
+def build_handler(ack_delay: float | None, requeue_poison: bool):
+    """Return the on_message callback, closed over the experiment flags.
 
-def build_handler(ack_delay: float | None):
-    """Return the on_message callback, closed over the ack delay.
-
-    A closure rather than a module-level global, so the delay is visible in the
+    A closure rather than module-level globals, so the flags are visible in the
     call chain and the handler stays assertable against a mock channel.
     """
 
+    def reject(method, reason: str, exc: Exception, channel) -> None:
+        """Dead-letter one message, or -- with --requeue-poison -- do not.
+
+        basic_reject, not basic_nack. Both dead-letter identically and both
+        produce x-death reason "rejected"; the difference is that basic.reject
+        is AMQP 0-9-1 core while basic.nack is a RabbitMQ extension, negotiated
+        per connection (pika exposes it as channel.basic_nack_supported). The
+        only thing nack adds is `multiple`, for rejecting a batch by delivery
+        tag -- which this never does, and which under this project's
+        explicit-over-inherited rule would have to be spelled out as
+        multiple=False for no gain.
+
+        The reason string only ever reaches this log line. x-death records the
+        *broker's* reason for the death ("rejected"), and RabbitMQ gives no way
+        to attach the application's, so a message sitting in telemetry.dlq does
+        not say whether it was truncated or merely off-contract.
+        """
+        log.warning(
+            "poison message, %s: reason=%s delivery_tag=%d redelivered=%s (%s)",
+            "REQUEUED (--requeue-poison)" if requeue_poison else "dead-lettered",
+            reason,
+            method.delivery_tag,
+            method.redelivered,
+            exc,
+        )
+        # requeue=False is the whole of stage 7: the message leaves this queue
+        # and routes through telemetry.dlx. requeue=True is the pathology the
+        # flag exists to demonstrate -- it goes straight back, is redelivered
+        # immediately, fails to parse again, and loops as fast as the link
+        # allows. Note it leaves NO x-death: that header is written only on an
+        # actual dead-letter, so the loop produces nothing to inspect.
+        channel.basic_reject(
+            delivery_tag=method.delivery_tag, requeue=requeue_poison
+        )
+
     def on_message(channel, method, properties, body: bytes) -> None:
         try:
-            payload = json.loads(body)
-            seq = payload[FIELD_SEQ]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            # Stage 7 turns this single call into
-            # basic_nack(delivery_tag, requeue=False), which routes the message
-            # to telemetry.dlx. Until then the message is consumed and
-            # discarded, and this line is its only trace -- acknowledged here
-            # rather than left unacknowledged, because an unacknowledged poison
-            # message holds a prefetch slot forever and ten of them wedge this
-            # consumer permanently.
-            log.warning(
-                "unparseable payload, acked and dropped: delivery_tag=%d (%s)",
-                method.delivery_tag,
-                exc,
-            )
-            channel.basic_ack(delivery_tag=method.delivery_tag)
+            payload = contract.parse(body)
+        except json.JSONDecodeError as exc:
+            # Not JSON at all -- what publisher's --corrupt-every produces.
+            reject(method, "malformed JSON", exc, channel)
             return
+        except ContractViolation as exc:
+            # JSON, but not this contract. Validated here rather than at stage
+            # 11 so that stage's failure test stays about the storage container
+            # being down, with no second variable.
+            reject(method, "off-contract", exc, channel)
+            return
+
+        seq = payload[FIELD_SEQ]
 
         if ack_delay is not None:
             # --ack-delay only. Blocking on purpose: it holds the delivery in
@@ -103,6 +135,16 @@ def build_parser() -> argparse.ArgumentParser:
             "A hand-run experiment; not reachable from `docker compose up`"
         ),
     )
+    parser.add_argument(
+        "--requeue-poison",
+        action="store_true",
+        help=(
+            "requeue unparseable messages instead of dead-lettering them, "
+            "reproducing the infinite redelivery loop on purpose. Pins a CPU "
+            "core until interrupted, and writes no x-death at all -- the "
+            "absence of evidence is the lesson. Ctrl-C to stop"
+        ),
+    )
     return parser
 
 
@@ -117,9 +159,16 @@ def main(argv: list[str] | None = None) -> int:
             settings.consumer_prefetch_count,
         )
 
+    if args.requeue_poison:
+        log.error(
+            "--requeue-poison: poison messages will be REQUEUED, not "
+            "dead-lettered. Expect an unbounded redelivery loop and a pinned "
+            "CPU core. telemetry.dlq will stay empty. Ctrl-C to stop."
+        )
+
     return run_consumer(
         spec.QUEUE_STORE,
-        build_handler(args.ack_delay),
+        build_handler(args.ack_delay, args.requeue_poison),
         auto_ack=False,
         prefetch_count=settings.consumer_prefetch_count,
     )

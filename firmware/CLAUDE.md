@@ -28,13 +28,28 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 6, so there are consumers now
+reachable yet** — the software track is at stage 7, so there are consumers now
 but still no InfluxDB and no dashboard. Sign that half off when the software
 track reaches stage 13; do not quietly redefine it.
 
-Stage 6 did confirm one half of the contract end to end: the MCU's messages are
+Stage 6 confirmed one half of the contract end to end: the MCU's messages are
 consumed off both queues, parsed, and logged with matching `seq` on both paths,
 against a consumer written with no knowledge of the firmware.
+
+**Stage 7 now enforces that contract**, and this is the one stage-7 change with
+a hardware consequence. `consumer_store` validates all five fields and
+dead-letters anything that fails, so a firmware payload change that breaks the
+contract no longer passes silently — it fills `telemetry.dlq` instead.
+
+Two things were deliberately made permissive so the firmware cannot trip them by
+accident. Readings accept a JSON int as well as a float, because `29` and `29.0`
+are the same number and which one is emitted depends on the format string —
+strict float matching would dead-letter valid DHT11 whole numbers after any
+formatting change. And **extra fields are allowed**, so the firmware may add one
+(RSSI, uptime) without the consumers having to be redeployed in lockstep.
+
+What it will reject: a missing field, a non-finite reading, a JSON `true` where
+a number belongs, or a payload that is not a JSON object.
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four
@@ -705,8 +720,11 @@ changed, so nothing below it has to move.
 
 ## The payload contract (stage 17)
 
-Frozen at stage 5. Firmware must satisfy it exactly; not open to renegotiation.
-Rationale for each field is in `src/telemetry/CLAUDE.md`.
+Frozen at stage 5, and **enforced by the consumers from stage 7** — a payload
+that fails it is dead-lettered into `telemetry.dlq`, not merely logged. Firmware
+must satisfy it exactly; not open to renegotiation. The contract lives in
+`src/telemetry/payload.py`, and the rationale for each field is in
+`src/telemetry/CLAUDE.md`.
 
 ```json
 {
@@ -720,9 +738,16 @@ Rationale for each field is in `src/telemetry/CLAUDE.md`.
 
 - `seq` — monotonic int, restarts at 1 each boot; deliberately not globally unique
 - `device` — must differ from the simulator's value
-- `temp_c` / `humidity_pct` — floats, matching `dht_read_float_data()` so no
+- `temp_c` / `humidity_pct` — **floats**, matching `dht_read_float_data()` so no
   conversion is needed. Note the driver's argument order is **humidity first**,
-  the opposite of this field order.
+  the opposite of this field order. Both must be finite.
+
+  **Keep emitting floats.** The consumer tolerates a bare `29` rather than
+  `29.0` so that a format-string change cannot silently dead-letter good
+  readings, but that is a safety net, not permission to change what the firmware
+  sends — and it may not survive stage 11, where InfluxDB's typed fields could
+  reject an integer written to a field already created as a float. Unverified
+  until then.
 - `ts_ms` — epoch **milliseconds**, publisher-stamped; needs SNTP, implemented at
   stage 17 in `time_sync.c`
 - MQTT topic `sensors/esp32c3/telemetry`, **QoS 1**, protocol version **5.0**
@@ -741,4 +766,13 @@ persistent AMQP message, and routing key `sensors.esp32c3.telemetry`. Only
 `29.0` / `53.0` exactly as the driver's behaviour predicted.
 
 Also settled: the MQTT 5 **Content Type property does map through** to AMQP
-`content_type` (`application/json` observed on the queued message).
+`content_type` (`application/json` observed on the queued message), and it
+**survives dead-lettering** — it is still on the message in `telemetry.dlq`.
+
+**What will now dead-letter an MCU payload** (stage 7): a missing field, a
+non-finite reading, a `true` where a number or integer belongs, a string where a
+number belongs, or a body that is not a JSON object. **Extra fields are
+allowed** — the firmware may add one, such as RSSI or uptime, without the
+consumers needing to be redeployed in lockstep. That permissiveness is
+deliberate: firmware and consumers are deployed separately and cannot be updated
+together.

@@ -39,19 +39,22 @@ from telemetry import topology_spec as spec
 from telemetry.config import settings
 from telemetry.logging_setup import configure_logging
 
-log = logging.getLogger(__name__)
-
 # --- The payload contract ---------------------------------------------------
-# Field names as module constants rather than a shared module: no consumer
-# needs to parse them until stage 6, and extracting them before then would be
-# speculative. Revisit when consumer_observe.py or consumer_store.py exist.
-FIELD_SEQ = "seq"
-FIELD_DEVICE = "device"
-FIELD_TEMP_C = "temp_c"
-FIELD_HUMIDITY_PCT = "humidity_pct"
-FIELD_TS_MS = "ts_ms"
+# Moved to payload.py at stage 7, when both consumers began validating the whole
+# contract rather than reading one field -- the revisit this comment used to ask
+# for. Re-exported here rather than referenced through the module, so the names
+# stay reachable as publisher.FIELD_SEQ for anything that already used them.
+from telemetry.payload import (  # noqa: F401  -- re-exported deliberately
+    CONTENT_TYPE_JSON,
+    FIELD_DEVICE,
+    FIELD_HUMIDITY_PCT,
+    FIELD_SEQ,
+    FIELD_TEMP_C,
+    FIELD_TS_MS,
+    build_payload,
+)
 
-CONTENT_TYPE_JSON = "application/json"
+log = logging.getLogger(__name__)
 
 # DHT11 range and resolution (README / stage 5 planning): roughly 0-50 degC
 # and 20-90 %RH, at 1-unit resolution. Values below step by whole units even
@@ -141,18 +144,6 @@ def now_ms() -> int:
     into a handful of points.
     """
     return time.time_ns() // 1_000_000
-
-
-def build_payload(seq: int, temp_c: float, humidity_pct: float, ts_ms: int) -> dict:
-    return {
-        FIELD_SEQ: seq,
-        FIELD_DEVICE: settings.device_id,
-        # float(): dht_read_float_data() on the firmware side returns floats,
-        # so the contract does not force a type conversion at stage 17.
-        FIELD_TEMP_C: float(temp_c),
-        FIELD_HUMIDITY_PCT: float(humidity_pct),
-        FIELD_TS_MS: ts_ms,
-    }
 
 
 def should_corrupt(seq: int, corrupt_every: int | None) -> bool:

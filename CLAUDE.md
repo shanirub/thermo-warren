@@ -16,7 +16,7 @@ stage"; a scalar marker cannot describe two tracks.**
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 6** — both consumers real and verified: manual ack and bounded prefetch on the durable path, auto-ack on the lossy one. `stub.py` deleted. |
+| **Software** | **Stage 7** — dead-lettering by rejection, verified. `consumer_store` rejects anything failing the payload contract without requeueing; the payload contract now lives in `payload.py`. |
 | **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
 **The two tracks have now met, and the parallelism ends here.** Hardware is done
@@ -24,15 +24,18 @@ through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
 *both* halves, so it cannot start until software reaches stage 13. There is no
 independent hardware work left to schedule.
 
-Next: **stage 7** on the software track (dead-lettering trigger 1: the durable
-consumer rejects unparseable messages without requeueing), then 8-13. Stage 17's
-own DoD gets its second half signed off when stage 13 lands — the MCU side is
-already proven and needs no rework for it.
+Next: **stage 8** on the software track (dead-lettering trigger 2: a short
+message TTL on `telemetry.store`, which needs a destructive redeclare), then
+9-13. Stage 17's own DoD gets its second half signed off when stage 13 lands —
+the MCU side is already proven and needs no rework for it.
 
-Stage 7 is a one-line change by construction: `consumer_store`'s parse-failure
-branch already exists and already logs, so `basic_ack` becomes
-`basic_nack(requeue=False)`. The test asserting the current behaviour is meant
-to be inverted, not deleted.
+**A note on predicting the next stage.** Stage 6 recorded here that "stage 7 is
+a one-line change by construction". It was not: choosing to validate the whole
+payload contract rather than only parse failures added a module, and the call
+turned out to be `basic_reject` rather than the predicted `basic_nack`. The
+prediction was written as though it were a decision, and it was neither
+reviewed nor re-opened before being acted on. **Record decisions, not forecasts
+of stages not yet planned.**
 
 ## Layout
 
@@ -94,8 +97,11 @@ belonging to a later stage get recorded, not implemented.
 ## Python conventions
 
 - Dependencies via **uv**; `pyproject.toml` is the source of truth.
-- Configuration resolved once in `config.py`, never re-read; **no literals
-  outside it**.
+- Configuration resolved once in `config.py`, never re-read.
+- **No literals outside the three files that own them**: `config.py` (what
+  differs between run modes), `topology_spec.py` (what the broker enforces) and
+  `payload.py` (what publisher and consumers must agree on, which the broker
+  never inspects).
 - Topology lives in `topology_spec.py`, separate from the code that declares it.
 - `seq=<int>` appears as a bare token in every log line about a message, so
   `grep -o 'seq=[0-9]*'` works as a comparison tool.
