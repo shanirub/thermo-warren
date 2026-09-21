@@ -28,9 +28,13 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 5, so there is no consumer, no
-InfluxDB and no dashboard. Sign that half off when the software track reaches
-stage 13; do not quietly redefine it.
+reachable yet** — the software track is at stage 6, so there are consumers now
+but still no InfluxDB and no dashboard. Sign that half off when the software
+track reaches stage 13; do not quietly redefine it.
+
+Stage 6 did confirm one half of the contract end to end: the MCU's messages are
+consumed off both queues, parsed, and logged with matching `seq` on both paths,
+against a consumer written with no knowledge of the firmware.
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four
@@ -738,5 +742,3 @@ persistent AMQP message, and routing key `sensors.esp32c3.telemetry`. Only
 
 Also settled: the MQTT 5 **Content Type property does map through** to AMQP
 `content_type` (`application/json` observed on the queued message).
-`src/telemetry/CLAUDE.md` still records that as unverified — fix it there when
-the software track is next touched.

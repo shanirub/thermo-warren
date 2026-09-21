@@ -7,11 +7,10 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 5 done and verified.** Next is stage 6.
+**Software track state: stage 6 done and verified.** Next is stage 7.
 
-`consumer_observe.py` and `consumer_store.py` are still **stage 2 stubs**.
-`stub.py` still exists and is still called by both; it is deleted once the last
-caller is gone, which is **at the end of stage 6**.
+Both consumers are real. `stub.py` is **deleted** — its last callers are gone,
+exactly as planned. Shared AMQP plumbing now lives in `amqp.py`.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -51,6 +50,15 @@ The reasoning matters. A wrong hostname fails loudly by name; a wrong routing ke
 fails **silently** — both queues stay empty forever with no error anywhere.
 `extra="ignore"` on the settings model means a typo'd `.env` key is inert, and
 any name field would need a default, so a typo would fall back rather than raise.
+
+**`amqp.py` (stage 6) holds how to reach the broker and how to stay attached to
+a queue.** It knows no queue names and no arguments — that stays in
+`topology_spec.py`. `connect()` was written for `topology.py` at stage 4 and
+both consumers need it unchanged, along with the auth-ordering fix and the
+pika-noise suppression around it; three copies would drift, which is the same
+argument that made `logging_setup.py` shared. `topology.py` imports `EXIT_OK`,
+`EXIT_UNREACHABLE`, `EXIT_REJECTED` from it and keeps only `EXIT_MISMATCH = 4`,
+which is meaningless for a consumer.
 
 - **`topology_spec.py` does not import `config.py`, and is not imported by it.**
   Cross-referencing docstrings serve discoverability instead. Making names
@@ -212,6 +220,167 @@ implemented fix is `wait_for_publish()` on every message before disconnecting.
 This matters at stage 9 because a premature disconnect and an overflow drop
 produce the *same* symptom: a hole in the `seq` sequence.
 
+## Consumers (stage 6, implemented and verified)
+
+Both are real; `stub.py` is gone. Shared machinery is in `amqp.py`:
+`connect()`, and `run_consumer(queue, on_message, *, auto_ack, prefetch_count)`
+which owns the signal handling, the reconnect loop, `basic_qos`,
+`add_on_cancel_callback`, `basic_consume` and `start_consuming`.
+
+### The asymmetry is expressed twice, deliberately
+
+- **`consumer_observe`: `auto_ack=True`, and `basic_qos` is never called.**
+- **`consumer_store`: manual ack, `prefetch_count=10`, `global_qos=False`.**
+
+The plan's stage 6 wording attaches manual ack and bounded prefetch specifically
+to the durable consumer; the observation one "logs". Making the path lossy in
+the consumer *as well as* in the queue means one unclean kill produces two
+different outcomes on the same messages — **verified**: store's 10
+unacknowledged returned to ready, observe's in-flight deliveries were gone.
+
+**`prefetch_count=None` means "do not call `basic_qos` at all"**, not zero.
+`basic_qos` is **ignored on an auto-ack channel** — the broker considers a
+message acknowledged the moment it writes it to the socket, so there is no
+unacknowledged window to bound. Passing it would imply a limit that does not
+exist. **Verified**: `telemetry.observe` sat at `unacked=0` throughout the
+ack-delay test while `telemetry.store` pinned at 10.
+
+Cost of auto-ack, accepted: no backpressure, permanently. A consumer slower than
+the publisher accumulates in pika's frame buffer rather than in queue depth.
+Irrelevant at 1 Hz; it changes where you look when something misbehaves.
+
+### prefetch_count = 10
+
+**10 rather than 1 because a cap of 1 is unobservable** — "unacked pinned at 1"
+looks identical whether `basic_qos` was called or not, so the DoD check would
+pass without proving anything. 10 is reachable in ~20 s with `--ack-delay 2`
+against the 1 Hz publisher and needs no manufactured backlog; 100 would have
+needed `--burst 200` first.
+
+**The number has a second meaning that bites at stage 11:** prefetch is the
+at-least-once duplicate window, because an unclean crash redelivers every
+unacknowledged message. 10 is how many duplicates a crash manufactures.
+
+Lives as `consumer_prefetch_count` in `config.py`, following
+`publish_interval_seconds` — steady-state behaviour compose needs with no
+arguments.
+
+### Malformed payloads: acked, not rejected — until stage 7
+
+`consumer_store` logs at WARNING with the delivery tag, then **acks**. Stage 7
+owns reject-and-dead-letter, and doing it here would collapse two stages.
+
+The deciding argument was stage 7's diff: with the branch already in place and
+already logging, **stage 7 is one line** — `basic_ack` →
+`basic_nack(requeue=False)`. `tests/test_consumers.py` carries a test asserting
+the current behaviour that is meant to be **deliberately inverted** at stage 7.
+
+Acked rather than left unacknowledged because an unacknowledged poison message
+holds a prefetch slot forever and 10 of them wedge the consumer permanently.
+
+`consumer_observe` merely logs the same bytes — that queue has no DLX to send
+them to, which is the other half of stage 7's contrast.
+
+### basic_consume + start_consuming, not the consume() generator
+
+**Under the generator a broker-initiated cancel is silent.**
+`blocking_connection.py:2085-2091`: a `_ConsumerCancellationEvt` sets
+`_queue_consumer_generator = None` and `break`s — no exception, no callback, the
+loop just ends and the process exits looking cleanly shut down. In the callback
+path (`:1592-1596`) pika does `del self._consumer_infos[tag]` and *then* fires
+`add_on_cancel_callback`, so there is a frame to log.
+
+This is not hypothetical: **`--recreate` deletes the queues these consumers are
+attached to**, and stages 8 and 9 both run it. **Verified** — running
+`--recreate` with both attached logged, on each:
+
+```
+ERROR telemetry.amqp broker cancelled our consumer on telemetry.store
+      (queue deleted?): <Basic.Cancel([...])>
+```
+
+and both reattached 2 s later.
+
+**Consequence for the loop:** `start_consuming()` **returns normally** on a
+broker cancel rather than raising, so `_Session.cancelled_by_broker` is what
+distinguishes it from a requested stop. Without that flag the two are
+indistinguishable.
+
+### Shutdown
+
+SIGTERM/SIGINT set a stop flag and then call
+`connection.add_callback_threadsafe(channel.stop_consuming)` — **not
+`stop_consuming()` directly**, which issues a Basic.Cancel and flushes output,
+re-entering pika's socket I/O from a handler that may have interrupted it
+mid-operation. `add_callback_threadsafe` only enqueues.
+
+Per `stop_consuming()`'s docstring, a clean stop **rejects pending ackable
+messages** (back to ready) and **loses pending non-ackable ones** — the same
+asymmetry as an unclean kill, for the same reason.
+
+### Reconnect
+
+**pika's `BlockingConnection` has no automatic reconnect**;
+`connection_attempts` and `retry_delay` govern only the *initial* connect
+(`connection.py:233-254`). So the loop is ours, and it is a deliberate
+divergence from `publisher.py`, which gets reconnect free from paho.
+
+- **The first connect stays bounded and exits 2 on failure**, so a typo'd
+  hostname fails loudly naming the endpoint instead of looping forever.
+- **Every later loss reconnects without limit**, backing off from
+  `rabbitmq_connect_retry_delay` to `RECONNECT_MAX_DELAY_SECONDS = 30.0`. The
+  30 s mirrors the firmware's Wi-Fi backoff cap, so both halves of the project
+  take the same worst case to notice a network returned.
+- **Unbounded because of host mode.** Under compose `restart: unless-stopped`
+  would catch an exiting consumer; run directly against exposed ports there is
+  nothing to catch it, and the project requires that mode.
+- **The except ordering is load-bearing, exactly as in `connect()`.**
+  `StreamLostError`, `ConnectionClosedByBroker`, `ConnectionClosedByClient`,
+  `ProbableAuthenticationError` and `ProbableAccessDeniedError` **all** subclass
+  `AMQPConnectionError`. A broad handler placed first would retry forever
+  against a wrong password and would also "recover" from our own clean shutdown
+  — hence the `if stopping: break` guard inside it.
+- `ChannelClosedByBroker` (404 on `basic_consume`, queue gone) is caught and
+  retried rather than fatal, because `--recreate` produces exactly that window.
+
+**Verified** on a `docker compose restart rabbitmq`: both consumers logged
+`CONNECTION_FORCED (320)`, backed off 2 s, failed one attempt, and resumed on
+the second — about 4 s end to end, no operator action.
+
+Note pika logs its own `ERROR Unexpected connection close detected` alongside
+ours. `_quiet_pika_connect_errors()` is scoped to connect attempts only and does
+not suppress it. Left visible: it names the AMQP reply code, which ours does not.
+
+### The ack-delay flag
+
+**`--ack-delay SECONDS` on `consumer_store` only**, default off, following the
+`--recreate` / `--corrupt-every` / `--burst` precedent: a hand-run experiment,
+visible in shell history, impossible to leave switched on, unreachable from a
+normal `docker compose up`. `consumer_observe` has no ack to delay.
+
+**It is a blocking `time.sleep()` inside the pika callback, which stalls the
+I/O loop and stops heartbeats.** At 2 s, harmless. Past the negotiated heartbeat
+interval it reproduces an unexplained broker disconnect — which is precisely the
+hazard stage 11 has to design the storage write around. The flag can demonstrate
+it on demand.
+
+### Where stage 11 goes
+
+`consumer_store.build_handler()` marks the insertion point in a comment: after
+the parse, **before** the ack. Acknowledging first loses the message on a crash
+between the two; acknowledging after redelivers it. That ordering is what makes
+the pipeline at-least-once end to end.
+
+### Stage 6 DoD — verified against real behaviour
+
+| Check | Result |
+|---|---|
+| Both queues drain with the publisher running | Both at 0 ready, 1 consumer each |
+| Both consumers report the same `seq` | Identical sets over the interior of both publisher streams |
+| Unacked pins at the prefetch limit | `telemetry.store` held at exactly **10** while ready grew; `telemetry.observe` at **0** throughout |
+| Unclean kill returns messages to ready | `SIGKILL` → unacked 10 → 0, ready rose by the 10 returned. Not lost |
+| Stop only `consumer_observe` | `telemetry.observe` grew 31 → 62 → 92 → **100** and held at its cap; `telemetry.store` stayed at 0, still draining |
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -241,7 +410,7 @@ produce the *same* symptom: a hole in the `seq` sequence.
 - **Exit codes:** `0` clean/declared, `2` broker unreachable, `3` auth or
   permissions rejected, `4` argument mismatch or other channel error. SIGTERM and
   SIGINT are handled for a clean disconnect, since compose sends SIGTERM.
-- **Tests must pass with no broker running.** 19/19 at stage 5. `declare(channel)`
+- **Tests must pass with no broker running.** 33/33 at stage 6. `declare(channel)`
   takes a channel rather than opening its own connection — that is the lever that
   makes the topology assertable against a mock, and the arguments dicts *are* the
   policy, so they are the thing worth asserting. Each test corresponds to a
@@ -296,10 +465,11 @@ when it is meant — destroying that volume is the only way
 `RABBITMQ_DEFAULT_USER`/`PASS` get re-applied, since they apply solely on first
 boot against an empty data directory.
 
-**Expected steady state at stage 5**, so `ps -a` does not look alarming:
-`rabbitmq` Up (healthy) and `publisher` Up; `topology`, `consumer-observe` and
-`consumer-store` all **`Exited (0)`** — the one-shot and the two stage 2 stubs
-doing exactly what they should. Management UI at `http://localhost:15672`.
+**Expected steady state at stage 6:** `rabbitmq` Up (healthy), and
+`publisher`, `consumer-observe` and `consumer-store` all Up. **Only `topology`
+is `Exited (0)`** — the one-shot declarer having done its job, which is what the
+other three gate on. Both queues sit near `ready=0` with `consumers=1` each.
+Management UI at `http://localhost:15672`.
 
 ## Verified broker facts — do not re-search
 
@@ -345,6 +515,33 @@ doing exactly what they should. Management UI at `http://localhost:15672`.
   acknowledgement itself may have been lost. Republishing manufactures
   duplicates. This is at-least-once, and it is why `seq` exists in the payload.
 
+**AMQP consumers** (verified at stage 6)
+
+- **RabbitMQ sends `Basic.Cancel` to a consumer whose queue is deleted.**
+  Observed directly by running `topology.py --recreate` with both consumers
+  attached. The channel stays open; only the consumer goes away. This is a
+  RabbitMQ extension, not core AMQP 0-9-1.
+- **`basic_qos` is ignored on a channel using automatic acknowledgment.** Not a
+  pika quirk — there is no unacknowledged window to bound, because the broker
+  considers the message done when it writes it to the socket. Confirmed by
+  `telemetry.observe` sitting at `unacked=0` while `telemetry.store` pinned at
+  its prefetch limit.
+- **pika's `BlockingConnection` has no automatic reconnect.**
+  `connection_attempts` and `retry_delay` apply to the *initial* connect only
+  (`connection.py:233-254`). A mid-session loss raises out of
+  `start_consuming()`.
+- **`start_consuming()` returns normally on a broker cancel**, rather than
+  raising — pika deletes the consumer from `_consumer_infos`
+  (`blocking_connection.py:1592-1596`) and the loop's `while self._consumer_infos`
+  condition simply ends. A flag set by the on-cancel callback is the only way to
+  tell it apart from a requested stop.
+- **`StreamLostError`, `ConnectionClosed`, `ConnectionClosedByBroker`,
+  `ConnectionClosedByClient`, `ProbableAuthenticationError` and
+  `ProbableAccessDeniedError` all subclass `AMQPConnectionError`.** Except
+  ordering around a reconnect loop is load-bearing: a broad handler first would
+  retry forever against a wrong password and would also "recover" from a clean
+  shutdown.
+
 **Dead-lettering**
 - Death reasons: `rejected` (nack/reject with requeue false), `expired` (TTL),
   `maxlen` (length limit). Recorded in the `x-death` header with the originating
@@ -371,6 +568,20 @@ depths climb **in lockstep**. **That is wrong.** `telemetry.observe` carries
 This is stage 9's lesson arriving early, not a bug. Treat the plan's wording as
 superseded; the README explains the cap.
 
+Stage 6's DoD says both consumers "report the same sequence numbers". True, but
+**only over the interior of a run, and only while `consumer_observe` keeps up**.
+Two things make a naive `diff` of the two `seq` sets show spurious differences:
+
+- **The ends never match.** The two consumers attach at different instants, so
+  the first and last few messages legitimately differ. Compare interiors.
+- **If `telemetry.observe` ever falls behind past its 100-message cap it drops
+  its head**, and those `seq` are genuinely absent from that path forever. That
+  is the design working, not a fan-out failure.
+
+Neither is a defect in the plan's intent, but a literal reading of "the same
+sequence numbers" will send you hunting for a bug that is not there. It did
+once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
+
 ## Environment facts learned the hard way
 
 - **`docker compose up -d <service>` does not rebuild after a `pyproject.toml`
@@ -390,52 +601,73 @@ superseded; the README explains the cap.
   CWD.
 - **Cross-check library APIs against the installed source**, not memory or
   tutorials. Done at stage 5 for `ReasonCode.is_failure`,
-  `Properties.ContentType` and `wait_for_publish` timeout semantics. **Worth
-  repeating for `pika` at stage 6.**
+  `Properties.ContentType` and `wait_for_publish` timeout semantics, and at
+  stage 6 for `basic_consume`, `basic_qos`, `start_consuming`, `consume()` and
+  `add_callback_threadsafe` — which is how the generator's silent broker-cancel
+  was found before it was written into the design rather than after.
+- **`configure_logging()` detaches pytest's `caplog` handler.** It calls
+  `logging.basicConfig(force=True)`, which removes *every* existing root
+  handler. A test that calls a `main()` then asserts on `caplog.text` sees an
+  empty capture while the lines themselves appear on stderr — which reads as
+  "the log line is missing" rather than "the handler is gone".
+  `tests/test_consumers.py` monkeypatches it to a no-op.
+- **`rabbitmqctl purge_queue` is per queue and not atomic across queues.**
+  Purging `telemetry.store` and then `telemetry.observe` leaves any message
+  published in between alive in the first and gone from the second — which looks
+  exactly like a fan-out failure when you diff the two consumers' `seq`. Cost a
+  real detour at stage 6. Compare interior ranges, or stop the publishers first.
 - **`docker compose up` without `-d` ties the stack's lifetime to the terminal.**
   Ctrl-C sends SIGTERM to every service and stops the lot — a graceful shutdown,
   not a kill, so nothing is corrupted, but the stack is then down. `restart:
   unless-stopped` does **not** bring it back, by design: that policy ignores an
   explicit operator stop. To read logs without owning the lifecycle, use
   `docker compose logs -f`.
-- **Do not use `docker compose up -d --wait` at stage 5 — it reports a false
-  failure.** Verified on Compose v5.5.1: it exits **1** with
-  `container thermo-warren-consumer-observe-1 exited (0)`, because `--wait` treats
-  any service leaving the running set as a failed wait, and the stage 2 consumer
-  stubs resolve config and exit 0 immediately. The run itself is correct — the
-  broker comes up healthy and the UI answers. `topology` exits too but does not
-  trip it, presumably because of its `service_completed_successfully` gate;
-  **that explanation is inferred, not verified.** **Revisit at stage 6:** once
-  both consumers are long-lived, `--wait` becomes the right readiness gate,
-  blocking until the broker is healthy and both consumers are actually consuming.
+- **`docker compose up -d --wait` works from stage 6 and is now the right
+  readiness gate.** **Verified**: exit 0 in 7.5s, blocking until the broker is
+  healthy and both consumers are actually consuming. At stage 5 it exited **1**
+  with `container thermo-warren-consumer-observe-1 exited (0)`, because `--wait`
+  treats any service leaving the running set as a failed wait and the stage 2
+  stubs exited immediately; making both consumers long-lived removed the cause.
+  `topology` still exits without tripping it — now observed twice, though the
+  explanation (its `service_completed_successfully` gate) remains **inferred,
+  not verified**.
 
-## Check first at stage 6
+## Check first at stage 7
 
-**Resolved: all three queues were observed empty at stage 17**, so stage 5's
-traffic — including the deliberately malformed messages from `--corrupt-every` —
-is gone. `consumer_store.py` will not meet a poison message on its first run
-before stage 7 has built the reject-and-dead-letter path.
+**Stage 6 confirmed the stage 6 prediction exactly**: at stage 6 start
+`telemetry.observe` held **100** (its cap) and `telemetry.store` held **66,702**
+— the MCU's well-formed `device=esp32c3-01` traffic accumulated since stage 17,
+with the unbounded queue showing what "unbounded" means. Both were purged.
 
-**But the MCU has been publishing since**, and it is well-formed traffic with
-`device=esp32c3-01`. Expect depth in both queues at stage 6, and note
-`telemetry.observe` will be sitting at its `x-max-length` cap of 100 while
-`telemetry.store` grows unbounded. Purge before measuring anything, or account
-for it.
+**Two publishers are live whenever the MCU is powered**: the simulator
+(`device=sim-01`, `seq` from 1) and the MCU (`device=esp32c3-01`, `seq` in the
+tens of thousands). Both use the same routing key, so both queues carry an
+interleaved stream and `grep -o 'seq=[0-9]*'` returns two unrelated series.
+Split them by magnitude, or stop one. This is stage 18's "run both publishers at
+once" row happening incidentally, and it is worth knowing before it looks like a
+bug.
+
+**`telemetry.dlq` is empty and stage 7 is the first thing that will put anything
+in it.** No stage 5 malformed traffic survives to confuse the first run.
 
 ## Open questions
 
-**Stage 6, raised and not yet answered:**
+**All six stage 6 questions are answered** — ack mode, prefetch value, ack-delay
+control, malformed-JSON handling, loop shape and reconnect strategy. See
+"Consumers (stage 6)" above; none of them is open.
 
-- **`consumer_observe`'s acknowledgment mode.** Manual or automatic. The
-  non-obvious coupling: **prefetch (`basic_qos`) only applies to channels using
-  manual acknowledgment** — with `auto_ack=True` the broker considers a message
-  acknowledged the moment it writes it to the socket, so there is no
-  unacknowledged window to bound and no flow control at all. Choosing auto-ack is
-  therefore also choosing "this consumer has no backpressure, permanently", which
-  is arguably the point of a lossy path but should be chosen rather than
-  inherited. Also undecided: prefetch value for `consumer_store`, consumer
-  lifecycle (long-lived vs drain-and-exit), where an ack-delay test control
-  lives, malformed-JSON handling per path, and reconnect strategy.
+**Raised at stage 6, deliberately not acted on:**
+
+- **`consumer_store` has no dead-letter behaviour yet** — that is stage 7, and
+  the test asserting malformed payloads are *acked* is meant to be inverted
+  there.
+- **Heartbeat interval is left at pika's negotiated default.** `--ack-delay`
+  past that interval reproduces a heartbeat timeout; nothing sets it explicitly,
+  which is a gap against the project's explicit-over-inherited rule. Recorded,
+  not fixed — stage 11 is where a blocking call in the callback stops being
+  hypothetical.
+- **`run_consumer()` takes no "drain and exit" mode.** Not needed by any stage
+  so far; noted because stage 18 might want one.
 
 **Carried forward from earlier stages:**
 
@@ -448,7 +680,5 @@ for it.
 - **InfluxDB and Grafana image tags** — unverified. RabbitMQ's is settled at
   `rabbitmq:4.3-management`.
 - **Grafana healthcheck** — unknown whether `curl` or `wget` exists in that image.
-- **`.env.example` contents** — whether it gained any stage 5 keys was not
-  reported. Check it matches `config.py` before stage 6 adds more.
 - **Optional hardening, not scheduled** — `iot` carries the `administrator` tag.
   Splitting a human admin from a scoped application user was raised and deferred.

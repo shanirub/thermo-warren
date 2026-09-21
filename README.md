@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 5 | Publisher verified; both consumers are stage-2 stubs that resolve configuration and exit |
+| Software | 6 | Both consumers verified: manual ack + bounded prefetch on the durable path, auto-ack on the lossy one. Both queues drain; fan-out independence proven |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -51,6 +51,93 @@ Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
 
+## Stage 6 verification
+
+Both consumers are long-lived from this stage, so the ordinary `up` is the whole
+setup. No rebuild is needed -- `pika` went in at stage 4 and all four Python
+services share one image, with `./src` bind-mounted.
+
+```bash
+docker compose up -d --wait     # works from stage 6; at stage 5 it falsely failed
+```
+
+Expected steady state: `rabbitmq` healthy and `publisher`, `consumer-observe`
+and `consumer-store` all Up. Only `topology` shows `Exited (0)`.
+
+**Purge first if the MCU has been publishing**, or every count below is wrong.
+Note `purge_queue` is per queue and not atomic across them: a message published
+between the two purges survives in one queue and not the other, which looks
+exactly like a fan-out failure.
+
+```bash
+for q in telemetry.store telemetry.observe telemetry.dlq; do
+  docker compose exec rabbitmq rabbitmqctl purge_queue $q
+done
+```
+
+### Both consumers see the same messages
+
+```bash
+docker compose logs consumer-observe | grep -o 'seq=[0-9]*' | sort -u
+docker compose logs consumer-store   | grep -o 'seq=[0-9]*' | sort -u
+```
+
+Compare the **interiors**, not the raw sets -- the ends differ purely by which
+consumer attached first. If the MCU is powered there are two publishers on one
+routing key, so you will see two unrelated `seq` series interleaved: the
+simulator from 1, the MCU in the tens of thousands. Split them by magnitude.
+
+### Draining is not the test: prefetch and the unclean kill
+
+```bash
+docker compose stop consumer-store
+uv run python -m telemetry.consumer_store --ack-delay 2      # host mode
+```
+
+Watch the unacknowledged count:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues \
+    name messages_ready messages_unacknowledged
+```
+
+`telemetry.store` should climb to **exactly 10** unacknowledged and hold there
+while `messages_ready` grows -- that is `basic_qos(prefetch_count=10)` bounding
+the window. `telemetry.observe` stays at **0** unacknowledged throughout, which
+is not a bug: `basic_qos` is ignored on an automatic-acknowledgment channel.
+
+Now kill it uncleanly (`kill -9` the host-mode process, or
+`docker kill -s SIGKILL` the container). Those 10 **must reappear as ready**. If
+they vanish, automatic acknowledgment is on somewhere it should not be.
+
+### Fan-out independence
+
+```bash
+docker compose stop consumer-observe
+```
+
+`telemetry.store` keeps draining at 0. `telemetry.observe` grows to **100** and
+then holds, silently dropping its head at `x-max-length`. The two paths are
+genuinely independent.
+
+### Reconnect, and a deleted queue
+
+```bash
+docker compose restart rabbitmq
+```
+
+Both consumers log `CONNECTION_FORCED (320)`, back off, and resume in a few
+seconds with no operator action. Then, with both attached:
+
+```bash
+uv run python -m telemetry.topology --recreate
+```
+
+Each consumer must log an explicit `broker cancelled our consumer ... (queue
+deleted?)` line carrying the `Basic.Cancel` frame, then reattach. That line is
+the reason this project uses `basic_consume` rather than pika's `consume()`
+generator, which would end silently instead.
+
 ## Stage 5 verification
 
 ```bash
@@ -68,10 +155,15 @@ docker compose up -d publisher
 docker compose logs -f publisher                      # ~1 line/second, seq incrementing
 ```
 
-THE DEFINITION OF DONE. With no consumers running -- both `consumer_observe.py`
-and `consumer_store.py` are still stage-6 stubs that resolve configuration and
-exit -- both queues can only grow. Check within the first minute or so of
-`publisher` starting:
+THE DEFINITION OF DONE. With no consumers running, both queues can only grow.
+**From stage 6 the consumers run by default and drain them**, so to reproduce
+this check you must stop them first:
+
+```bash
+docker compose stop consumer-observe consumer-store
+```
+
+Then check within the first minute or so of `publisher` starting:
 
 ```bash
 docker compose exec rabbitmq rabbitmqctl list_queues name messages
@@ -173,6 +265,7 @@ uv run pytest
 No broker needed. `build_payload`, `corrupt`, `should_corrupt` and
 `DriftSimulator` are pure functions, exercised the same way `declare()` is
 tested against a mock channel in stage 4 -- against no broker at all.
+
 
 ## Stage 4 verification
 
@@ -298,9 +391,10 @@ Nothing connects to a broker yet — RabbitMQ arrives at stage 3.
 | `src/telemetry/topology.py` | one-shot declarer; must complete before any publish | 4 |
 | `tests/` | unit tests over the declared topology; no broker required | 4 |
 | `src/telemetry/publisher.py` | software publisher standing in for the MCU | 5 |
+| `src/telemetry/amqp.py` | shared AMQP plumbing: connect with retry, and the reconnecting consumer runner | 6 |
 | `src/telemetry/consumer_observe.py` | observation path: bounded, lossy, no DLX | 6 |
 | `src/telemetry/consumer_store.py` | durable path: manual ack, DLX, writes to InfluxDB | 6, 11 |
 | `rabbitmq/rabbitmq.conf` | broker config; unknown keys abort startup | 3 |
 | `rabbitmq/enabled_plugins` | management + MQTT; Erlang syntax, trailing period | 3 |
 | `grafana/` | provisioned datasource and dashboard | 12 |
-| `firmware/` | ESP-IDF project (see `firmware/README.md`) | 14–16 |
+| `firmware/` | ESP-IDF project (see `firmware/README.md`) | 14–17 |

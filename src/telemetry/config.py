@@ -78,6 +78,22 @@ class Settings(BaseSettings):
     # field is not.
     publish_interval_seconds: float = 1.0
 
+    # --- Consumers (stage 6) ------------------------------------------------
+    # How many messages the broker may have in flight, unacknowledged, to
+    # consumer_store at once. Two meanings, and the second is the one that
+    # bites later: it is also the at-least-once duplicate window, because an
+    # unclean crash redelivers every unacknowledged message. 10 duplicates is
+    # what stage 11 has to decide what to do about.
+    #
+    # 10 rather than 1 because a cap of 1 is unobservable -- "unacked pinned at
+    # 1" looks identical whether basic_qos was called or not, so stage 6's DoD
+    # check would pass without proving anything. 10 is reachable in ~20s with
+    # --ack-delay 2 against the 1 Hz publisher, with no backlog to set up first.
+    #
+    # consumer_observe deliberately has no equivalent: it uses automatic
+    # acknowledgment, and basic_qos is ignored on such a channel.
+    consumer_prefetch_count: int = 10
+
     # --- Later stages ------------------------------------------------------
     # Topology names and queue arguments              -> topology_spec.py
     # InfluxDB url / org / bucket / token             -> stage 10
@@ -106,6 +122,7 @@ class Settings(BaseSettings):
             f"  mqtt_client_id       = {self.mqtt_client_id}",
             f"  device_id            = {self.device_id}",
             f"  publish_interval_s   = {self.publish_interval_seconds}",
+            f"  consumer_prefetch    = {self.consumer_prefetch_count}",
         ]
         return "\n".join(lines)
 

@@ -24,21 +24,21 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import logging
 import sys
-import time
 
-import pika
 from pika.adapters.blocking_connection import BlockingChannel
-from pika.exceptions import (
-    AMQPConnectionError,
-    ChannelClosedByBroker,
-    ProbableAccessDeniedError,
-    ProbableAuthenticationError,
-)
+from pika.exceptions import ChannelClosedByBroker
 
 from telemetry import topology_spec as spec
+from telemetry.amqp import (
+    EXIT_OK,
+    EXIT_REJECTED,
+    EXIT_UNREACHABLE,
+    BrokerUnreachable,
+    CredentialsRejected,
+    connect,
+)
 from telemetry.config import settings
 from telemetry.logging_setup import configure_logging
 
@@ -46,98 +46,10 @@ log = logging.getLogger(__name__)
 
 PRECONDITION_FAILED = 406
 
-EXIT_OK = 0
-EXIT_UNREACHABLE = 2
-EXIT_REJECTED = 3
+# 0, 2 and 3 are the project-wide convention and come from amqp.py, which needs
+# them for run_consumer()'s return value. 4 is declared here because it is
+# meaningless anywhere else: only a declarer can meet an argument mismatch.
 EXIT_MISMATCH = 4
-
-
-class BrokerUnreachable(RuntimeError):
-    """Every connection attempt failed."""
-
-
-class CredentialsRejected(RuntimeError):
-    """The broker refused our credentials or vhost permissions."""
-
-
-@contextlib.contextmanager
-def _quiet_pika_connect_errors():
-    """Silence pika's own traceback for one connection attempt.
-
-    A refused connection while the broker is still starting is expected here,
-    and the retry loop below already reports it in one line. pika reports the
-    same failure at ERROR several times over, across child loggers, with a
-    traceback -- which buries the line that matters. Silencing the "pika" parent
-    covers the children, since they carry no level of their own. Scoped to the
-    attempt, so genuine pika errors elsewhere are still visible.
-    """
-    logger = logging.getLogger("pika")
-    previous = logger.level
-    logger.setLevel(logging.CRITICAL)
-    try:
-        yield
-    finally:
-        logger.setLevel(previous)
-
-
-def connect() -> pika.BlockingConnection:
-    """Open a connection, retrying only on failures that waiting can fix.
-
-    The compose healthcheck (`check_port_connectivity`) is liveness, not
-    readiness -- it opens a socket with no handshake and no auth -- and in host
-    mode there is no healthcheck gate at all. Hence the loop.
-    """
-    params = pika.ConnectionParameters(
-        host=settings.rabbitmq_host,
-        port=settings.rabbitmq_amqp_port,
-        virtual_host=settings.rabbitmq_vhost,
-        credentials=pika.PlainCredentials(
-            settings.rabbitmq_user, settings.rabbitmq_password
-        ),
-        # Retry is owned by the loop below, not by pika. Stated explicitly even
-        # though it is the default: raising it later would nest pika's retries
-        # inside ours and multiply the attempts, with only the outer loop
-        # visible in the log.
-        connection_attempts=1,
-    )
-
-    attempts = settings.rabbitmq_connect_attempts
-    delay = settings.rabbitmq_connect_retry_delay
-
-    for attempt in range(1, attempts + 1):
-        log.info(
-            "connecting to %s (attempt %d of %d)",
-            settings.amqp_url,
-            attempt,
-            attempts,
-        )
-        try:
-            with _quiet_pika_connect_errors():
-                return pika.BlockingConnection(params)
-        except (ProbableAuthenticationError, ProbableAccessDeniedError) as exc:
-            # Both subclass AMQPConnectionError, so this block must stay above
-            # the broad one or it will never be reached. Waiting cannot fix a
-            # wrong password or a missing permission, so fail immediately
-            # rather than burning the full retry budget.
-            raise CredentialsRejected(
-                f"broker rejected user {settings.rabbitmq_user!r} on vhost "
-                f"{settings.rabbitmq_vhost!r}: {exc}"
-            ) from exc
-        except AMQPConnectionError as exc:
-            # pika often raises this with an empty message; fall back to the
-            # class name rather than logging a bare "failed:".
-            log.warning(
-                "attempt %d of %d failed: %s",
-                attempt,
-                attempts,
-                str(exc) or type(exc).__name__,
-            )
-            if attempt < attempts:
-                time.sleep(delay)
-
-    raise BrokerUnreachable(
-        f"no connection to {settings.amqp_url} after {attempts} attempts"
-    )
 
 
 def drop(channel: BlockingChannel) -> None:
