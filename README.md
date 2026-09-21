@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 6 | Both consumers verified: manual ack + bounded prefetch on the durable path, auto-ack on the lossy one. Both queues drain; fan-out independence proven |
+| Software | 7 | Dead-lettering by rejection verified: bad payloads reach `telemetry.dlq` with an `x-death` header and do not loop. Full payload-contract validation |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -50,6 +50,89 @@ docker compose run --rm publisher
 Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
+
+## Stage 7 verification
+
+No rebuild and no topology change — the dead-letter side has been declared since
+stage 4 and inert until now. `./src` is bind-mounted, but a running container
+holds the old code, so **restart the consumers** after pulling this stage.
+
+```bash
+docker compose up -d --wait
+docker compose restart consumer-observe consumer-store
+```
+
+Purge all three queues, then stop the publisher so a one-off run does not
+collide with it over the same MQTT client ID.
+
+```bash
+docker compose stop publisher
+```
+
+### The Definition of Done
+
+```bash
+docker compose run --rm publisher python -m telemetry.publisher \
+    --corrupt-every 5 --burst 40
+```
+
+Eight of the forty are corrupted. `telemetry.dlq` should gain exactly eight
+while `telemetry.store` and `telemetry.observe` drain to zero, and the `seq`
+missing from `consumer-store`'s log should be exactly 5, 10, 15 … 40.
+
+```bash
+docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
+docker compose logs consumer-store | grep poison
+```
+
+Each line names the failure class — `malformed JSON` or `off-contract` — because
+`x-death` cannot. `consumer-observe` logs the same eight and dead-letters none:
+same bytes, two fates, because that queue has no dead-letter exchange.
+
+### The x-death header
+
+`rabbitmqctl` cannot show message headers, so use the management HTTP API. This
+consumes nothing — `ack_requeue_true` puts the message back.
+
+```bash
+curl -su "$RABBITMQ_USER:$RABBITMQ_PASSWORD" \
+  -H 'content-type: application/json' \
+  -d '{"count":1,"ackmode":"ack_requeue_true","encoding":"auto"}' \
+  http://localhost:15672/api/queues/%2F/telemetry.dlq/get | python -m json.tool
+```
+
+Expect `reason: rejected`, `queue: telemetry.store`, `count: 1`, and
+`routing-keys: ["sensors.esp32c3.telemetry"]` — the original key survived,
+because `x-dead-letter-routing-key` is deliberately unset. The payload is
+visibly truncated. Note `exchange` is `amq.topic`, the *original* exchange, not
+the DLX.
+
+### The infinite redelivery loop, on purpose
+
+Put exactly one poison message in the queue, then run the consumer with the
+flag that requeues instead of dead-lettering:
+
+```bash
+docker compose stop consumer-store
+docker compose run --rm publisher python -m telemetry.publisher \
+    --corrupt-every 1 --burst 1
+timeout -s INT 5 uv run python -m telemetry.consumer_store --requeue-poison
+```
+
+Five seconds is plenty. Measured here: **58,733 redeliveries of one message**,
+73% of a core, `redelivered=True` on every one, and delivery tags climbing past
+58,000.
+
+**`telemetry.dlq` stays empty the whole time, and that is the point.** `x-death`
+is written only on an actual dead-letter, so a requeue loop leaves no header, no
+DLQ entry and nothing at all to find afterwards — just a hot core and a
+repeating log line. Restart the consumer without the flag and the same message
+dead-letters immediately, with `count: 1`, because `x-death` counts deaths, not
+deliveries.
+
+```bash
+docker compose start consumer-store publisher
+```
 
 ## Stage 6 verification
 
@@ -392,6 +475,7 @@ Nothing connects to a broker yet — RabbitMQ arrives at stage 3.
 | `tests/` | unit tests over the declared topology; no broker required | 4 |
 | `src/telemetry/publisher.py` | software publisher standing in for the MCU | 5 |
 | `src/telemetry/amqp.py` | shared AMQP plumbing: connect with retry, and the reconnecting consumer runner | 6 |
+| `src/telemetry/payload.py` | the frozen payload contract: field names, types, and the validating parse() | 7 |
 | `src/telemetry/consumer_observe.py` | observation path: bounded, lossy, no DLX | 6 |
 | `src/telemetry/consumer_store.py` | durable path: manual ack, DLX, writes to InfluxDB | 6, 11 |
 | `rabbitmq/rabbitmq.conf` | broker config; unknown keys abort startup | 3 |

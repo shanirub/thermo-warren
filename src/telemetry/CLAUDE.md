@@ -7,10 +7,11 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 6 done and verified.** Next is stage 7.
+**Software track state: stage 7 done and verified.** Next is stage 8.
 
-Both consumers are real. `stub.py` is **deleted** — its last callers are gone,
-exactly as planned. Shared AMQP plumbing now lives in `amqp.py`.
+Both consumers are real, and `consumer_store` dead-letters anything that fails
+the payload contract. Shared AMQP plumbing lives in `amqp.py`; the payload
+contract lives in `payload.py`.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -51,6 +52,19 @@ fails **silently** — both queues stay empty forever with no error anywhere.
 `extra="ignore"` on the settings model means a typo'd `.env` key is inert, and
 any name field would need a default, so a typo would fall back rather than raise.
 
+**`payload.py` (stage 7) holds the frozen payload contract** — field names,
+types, `build_payload()` and the validating `parse()`. It is a third category
+the other two do not cover, and the broker is the reason: **it never inspects
+the message body.** It routes on the key alone, so nothing in the broker will
+ever reject a payload for being the wrong shape, which makes this file the only
+enforcement point there is. It cannot live in `topology_spec.py` without
+breaking that module's one rule ("if the broker enforces it, it belongs here").
+
+It imports `config.py`, unlike `topology_spec.py`, for one reason stated in the
+source: `device` is the single contract field whose *value* legitimately differs
+between the simulator and the MCU, which is exactly what `config.py` is for. The
+field *names* are not configurable and never will be.
+
 **`amqp.py` (stage 6) holds how to reach the broker and how to stay attached to
 a queue.** It knows no queue names and no arguments — that stays in
 `topology_spec.py`. `connect()` was written for `topology.py` at stage 4 and
@@ -65,7 +79,10 @@ which is meaningless for a consumer.
   reachable as `settings.routing_key` was rejected — it creates an obvious next
   step toward letting `.env` override them.
 - Both modules expose `describe()`; the topology job logs both at startup.
-- **No literals outside `config.py` and `topology_spec.py`.**
+- **No literals outside `config.py`, `topology_spec.py` and `payload.py`.**
+  Three files, three categories, and the split is the point: an endpoint, a
+  queue argument and a field name fail in three different ways. `payload.py`
+  joined the list at stage 7.
 
 ## Topology
 
@@ -133,10 +150,15 @@ workarounds would land in the ESP32's credentials at stage 17.
 - **No `if_empty` / `if_unused` guards** — they would refuse exactly when needed,
   since stages 8 and 9 recreate queues that have been allowed to fill.
 
-## The payload contract (frozen at stage 5)
+## The payload contract (frozen at stage 5, enforced from stage 7)
 
 This is the **single interface between the software and hardware halves**. Stage
 17's firmware must satisfy it exactly.
+
+**It lives in `payload.py`** — names, types, `build_payload()` and the
+validating `parse()`, which both consumers call. From stage 7 a payload that
+fails it is dead-lettered rather than merely logged, so the contract is no
+longer only a document.
 
 ```json
 {
@@ -152,8 +174,27 @@ This is the **single interface between the software and hardware halves**. Stage
   **not** globally unique across restarts.
 - **`device`** — distinguishes simulator from ESP32; becomes an InfluxDB tag at
   stage 11.
-- **`temp_c` / `humidity_pct`** — floats, units in the field name, matching
-  `dht_read_float_data()` so stage 17 needs no type conversion.
+- **`temp_c` / `humidity_pct`** — **floats**, units in the field name, matching
+  `dht_read_float_data()` so stage 17 needs no type conversion. Unchanged since
+  stage 5; this is what a publisher is obliged to emit.
+
+  **`parse()` is deliberately more tolerant than the contract here**, and the
+  distinction matters: it accepts a JSON integer as well, so a publisher that
+  emitted `29` instead of `29.0` would not be dead-lettered. That is a safety
+  net against a format-string change silently destroying good readings — they
+  would look perfectly correct sitting in the DLQ — and **not** a relaxation of
+  what publishers must send. Both publishers still send floats.
+
+  Both must be **finite**. Python's `json` accepts `NaN` and `Infinity`, which
+  pass every `isinstance` check and fail only at the storage write.
+
+  **Unverified, and it belongs to stage 11:** InfluxDB fields are typed, and a
+  field first written as a float rejects a later integer with a field-type
+  conflict. The `influxdb-client` mapping from Python `int` is expected to
+  produce an integer field, so the tolerance above could let through a value
+  that the write then refuses. Expected, **not checked** — there is no InfluxDB
+  before stage 10. If it holds, stage 11's write coerces with `float()` and the
+  tolerance stays purely a dead-lettering decision.
 - **`ts_ms`** — epoch **milliseconds**, publisher-stamped. Milliseconds
   specifically because InfluxDB point identity is measurement + tag set +
   timestamp, so points sharing a timestamp overwrite rather than accumulate; at
@@ -265,21 +306,24 @@ Lives as `consumer_prefetch_count` in `config.py`, following
 `publish_interval_seconds` — steady-state behaviour compose needs with no
 arguments.
 
-### Malformed payloads: acked, not rejected — until stage 7
+### Malformed payloads: acked at stage 6, rejected from stage 7
 
-`consumer_store` logs at WARNING with the delivery tag, then **acks**. Stage 7
-owns reject-and-dead-letter, and doing it here would collapse two stages.
+**Superseded — see "Rejection and dead-lettering" below.** Kept because the
+reasoning still holds and one prediction in it was wrong, which is worth
+recording.
 
-The deciding argument was stage 7's diff: with the branch already in place and
-already logging, **stage 7 is one line** — `basic_ack` →
-`basic_nack(requeue=False)`. `tests/test_consumers.py` carries a test asserting
-the current behaviour that is meant to be **deliberately inverted** at stage 7.
+Stage 6 acked poison messages so that reject-and-dead-letter stayed stage 7's,
+rather than collapsing two stages. It also predicted stage 7 would be **one
+line**, `basic_ack` → `basic_nack(requeue=False)`. **Both halves of that
+prediction turned out wrong**: the call became `basic_reject`, not `basic_nack`,
+and validating the whole contract rather than only parse failures made the stage
+considerably larger than one line. The test written to be inverted was inverted
+as intended.
 
-Acked rather than left unacknowledged because an unacknowledged poison message
-holds a prefetch slot forever and 10 of them wedge the consumer permanently.
-
-`consumer_observe` merely logs the same bytes — that queue has no DLX to send
-them to, which is the other half of stage 7's contrast.
+The part that held: a poison message must never be left unacknowledged, because
+it would hold a prefetch slot forever and 10 of them wedge the consumer. A
+reject settles the delivery exactly as an ack does, so the property survived the
+change of call.
 
 ### basic_consume + start_consuming, not the consume() generator
 
@@ -381,6 +425,94 @@ the pipeline at-least-once end to end.
 | Unclean kill returns messages to ready | `SIGKILL` → unacked 10 → 0, ready rose by the 10 returned. Not lost |
 | Stop only `consumer_observe` | `telemetry.observe` grew 31 → 62 → 92 → **100** and held at its cap; `telemetry.store` stayed at 0, still draining |
 
+## Rejection and dead-lettering (stage 7, implemented and verified)
+
+`consumer_store` rejects anything that fails the contract, without requeueing,
+so it routes through `telemetry.dlx` into `telemetry.dlq`. **No topology change
+was needed** — the dead-letter side has been declared and inert since stage 4.
+
+### basic_reject, not basic_nack
+
+Both dead-letter identically and both produce `x-death` reason `rejected`, so
+the DoD cannot separate them. The difference is protocol-level: **`basic.reject`
+is AMQP 0-9-1 core; `basic.nack` is a RabbitMQ extension**, negotiated per
+connection and exposed by pika as `channel.basic_nack_supported`
+(`blocking_connection.py:974`).
+
+The tie-breaker was the explicit-over-inherited rule. nack's only addition is
+`multiple`, for rejecting a batch by delivery tag — which this never does, and
+which would have to be spelled out as `multiple=False` for no gain. `reject` has
+no such parameter.
+
+### What counts as poison: the whole contract, not just a parse failure
+
+**This is the decision that widened stage 7 beyond the one-line change stage 6
+predicted.** `payload.parse()` validates all five fields and their types, and
+both failure classes dead-letter:
+
+| Class | Raised | Example |
+|---|---|---|
+| malformed JSON | `json.JSONDecodeError` | what `--corrupt-every` produces |
+| off-contract | `ContractViolation` | missing field, `NaN`, `true` for `seq`, a JSON array |
+
+**The reason is stage 11.** That stage's lesson is write failures and
+acknowledgment ordering, and a payload-shape failure arriving there adds a
+second variable to exactly the stage that should have one. Validating where the
+DLX already exists keeps stage 11 about the storage container being down.
+Accepted cost: branches that can only fire if one of our own publishers breaks
+its own contract.
+
+**Verified this was not theoretical:** an injected `"temp_c": NaN` dead-lettered
+on the contract check. Without it, `NaN` passes every `isinstance` check and
+reaches the InfluxDB write.
+
+### Both consumers use the same parse()
+
+The lesson is "same bytes, two fates", which is only an honest comparison if both
+consumers consider the same messages bad. Only the consequence differs:
+`consumer_store` rejects, `consumer_observe` logs and moves on because
+`telemetry.observe` has no DLX to reject into.
+
+**Verified:** a 40-message burst with `--corrupt-every 5` produced 8 malformed
+payloads; `telemetry.dlq` gained exactly 8, `consumer_observe` logged exactly 8
+and dead-lettered none, and the `seq` absent from `consumer_store`'s stored set
+were exactly `[5, 10, 15, 20, 25, 30, 35, 40]`.
+
+### x-death carries the broker's reason, not ours
+
+**There is no way to attach an application reason to a rejection.** `x-death`
+records `rejected` for every rejection regardless of why we rejected, so a
+message sitting in `telemetry.dlq` does not say whether it was truncated or
+merely off-contract. Reading the payload tells you, and so does the consumer log
+— which is why the log line names the failure class. Getting a reason *into* the
+DLQ would mean republishing with your own headers instead of using the DLX at
+all, which is a much heavier pattern.
+
+### --requeue-poison: the pathology, on purpose
+
+A hand-run flag on `consumer_store`, default off, following the `--recreate` /
+`--corrupt-every` / `--burst` / `--ack-delay` precedent. Re-runnable matters:
+stage 18's failure matrix has a "malformed payload in steady state" row.
+
+**Measured on one poison message over 5 seconds:**
+
+| | |
+|---|---|
+| Redeliveries | **58,733** (~11,700/s) |
+| CPU | 73% of one core |
+| `redelivered` flag | `True` on all 58,733 |
+| Delivery tags | climbed 1 → 58,752 |
+| `telemetry.dlq` | **0 — stayed empty throughout** |
+
+**The empty DLQ is the whole lesson.** `x-death` is written only on an actual
+dead-letter, so a requeue loop produces *no artifact at all* — no header, no
+DLQ entry, nothing to inspect afterwards. The only evidence is a log line
+repeating and a hot core. The same message, replayed with the flag off,
+dead-lettered once immediately with a complete `x-death`.
+
+Note `x-death`'s `count` read **1**, not 58,733: it counts **deaths, not
+deliveries**. A requeue is not a death.
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -410,7 +542,14 @@ the pipeline at-least-once end to end.
 - **Exit codes:** `0` clean/declared, `2` broker unreachable, `3` auth or
   permissions rejected, `4` argument mismatch or other channel error. SIGTERM and
   SIGINT are handled for a clean disconnect, since compose sends SIGTERM.
-- **Tests must pass with no broker running.** 33/33 at stage 6. `declare(channel)`
+- **Tests must pass with no broker running.** 78/78 at stage 7, across
+  `test_topology.py`, `test_publisher.py`, `test_consumers.py` and
+  `test_payload.py`. The last two are split on purpose: `test_payload.py`
+  asserts what `parse()` accepts and rejects, `test_consumers.py` asserts what
+  each consumer *does* about it. Both are needed — the handler catches
+  `ContractViolation` broadly, so "parse rejects a `NaN`" and "the consumer
+  dead-letters a `NaN`" are separate claims, and the second is parametrized over
+  every off-contract class. `declare(channel)`
   takes a channel rather than opening its own connection — that is the lever that
   makes the topology assertable against a mock, and the arguments dicts *are* the
   policy, so they are the thing worth asserting. Each test corresponds to a
@@ -542,6 +681,26 @@ Management UI at `http://localhost:15672`.
   retry forever against a wrong password and would also "recover" from a clean
   shutdown.
 
+**Dead-lettering — observed at stage 7, not just read**
+
+- **`x-death` records the broker's reason, never the application's.** Every
+  rejection lands as `reason: rejected` whatever the consumer's own reason was,
+  and RabbitMQ offers no way to attach one. Distinguishing "truncated" from
+  "off-contract" means reading the payload or the consumer log.
+- **A requeue writes no `x-death` at all.** The header is written only on an
+  actual dead-letter, so a redelivery loop leaves no artifact anywhere.
+- **`x-death`'s `count` counts deaths, not deliveries.** A message redelivered
+  58,733 times and then dead-lettered once reads `count: 1`.
+- **`x-death.exchange` is the *original* exchange** (`amq.topic`), not the DLX.
+- **The original routing key survives** in `routing-keys`, confirming the
+  deliberate choice to leave `x-dead-letter-routing-key` unset.
+- **RabbitMQ also sets flat `x-first-death-*` and `x-last-death-*` headers**
+  (exchange, queue, reason) alongside the `x-death` array. Convenient for a
+  single death; the array is still the place to read the count.
+- **`content_type: application/json` survives dead-lettering**, so the MQTT 5
+  Content Type property set by the publisher is still visible on the DLQ
+  message.
+
 **Dead-lettering**
 - Death reasons: `rejected` (nack/reject with requeue false), `expired` (TTL),
   `maxlen` (length limit). Recorded in the `x-death` header with the originating
@@ -605,6 +764,19 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   stage 6 for `basic_consume`, `basic_qos`, `start_consuming`, `consume()` and
   `add_callback_threadsafe` — which is how the generator's silent broker-cancel
   was found before it was written into the design rather than after.
+- **Three JSON typing traps, all verified in the interpreter at stage 7**, and
+  all of them silent:
+  - **`json.loads("29")` is an `int`, `json.loads("29.0")` is a `float`.** JSON
+    has one number type, so which one arrives depends entirely on the
+    publisher's formatting. A strict `isinstance(x, float)` would dead-letter
+    valid readings after a firmware format-string change, and they would look
+    perfectly correct sitting in the DLQ.
+  - **`isinstance(True, int)` is `True`** — `bool` subclasses `int`, so a JSON
+    `true` passes a bare int check, and `isinstance(True, (int, float))` passes
+    too.
+  - **Python's `json` accepts `NaN`, `Infinity` and `-Infinity`** as an
+    extension to the spec. A `NaN` passes every `isinstance` check and only
+    fails later, at the storage write. `payload.py` requires `math.isfinite`.
 - **`configure_logging()` detaches pytest's `caplog` handler.** It calls
   `logging.basicConfig(force=True)`, which removes *every* existing root
   handler. A test that calls a `main()` then asserts on `caplog.text` sees an
@@ -632,35 +804,52 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   explanation (its `service_completed_successfully` gate) remains **inferred,
   not verified**.
 
-## Check first at stage 7
+## Check first at stage 8
 
-**Stage 6 confirmed the stage 6 prediction exactly**: at stage 6 start
-`telemetry.observe` held **100** (its cap) and `telemetry.store` held **66,702**
-— the MCU's well-formed `device=esp32c3-01` traffic accumulated since stage 17,
-with the unbounded queue showing what "unbounded" means. Both were purged.
+**Stage 8 adds `x-message-ttl` to `telemetry.store` and needs `--recreate`**,
+which deletes and redeclares both main queues. Consumers attached at the time
+get a `Basic.Cancel` and reattach on their own — verified at stage 6 — so this
+is safe to run with the stack up, but expect the ERROR line and do not read it
+as a fault.
 
-**Two publishers are live whenever the MCU is powered**: the simulator
+**The DLQ survives `--recreate` by design** and is not purged by it. Anything
+stage 7 put there is still there, and stage 8's expired messages will land
+alongside it. Purge it first if you want a clean count, and remember
+`purge_queue` is per queue and not atomic.
+
+**Death reason is how you tell stage 7 and stage 8 apart in the DLQ**:
+`rejected` came from the consumer, `expired` came from the TTL with no consumer
+involved at all. Stage 8's DoD is precisely that the second happens with
+`consumer_store` stopped.
+
+**Two publishers are live whenever the MCU is powered** — the simulator
 (`device=sim-01`, `seq` from 1) and the MCU (`device=esp32c3-01`, `seq` in the
-tens of thousands). Both use the same routing key, so both queues carry an
-interleaved stream and `grep -o 'seq=[0-9]*'` returns two unrelated series.
-Split them by magnitude, or stop one. This is stage 18's "run both publishers at
-once" row happening incidentally, and it is worth knowing before it looks like a
-bug.
-
-**`telemetry.dlq` is empty and stage 7 is the first thing that will put anything
-in it.** No stage 5 malformed traffic survives to confuse the first run.
+tens of thousands). Only the simulator can produce malformed traffic.
 
 ## Open questions
 
-**All six stage 6 questions are answered** — ack mode, prefetch value, ack-delay
-control, malformed-JSON handling, loop shape and reconnect strategy. See
-"Consumers (stage 6)" above; none of them is open.
+**All stage 6 and stage 7 questions are answered.** Stage 6: ack mode, prefetch
+value, ack-delay control, malformed-JSON handling, loop shape, reconnect. Stage
+7: reject vs nack, how to reproduce the redelivery loop, what counts as poison,
+where the contract lives, how strict the type check is. None is open.
+
+**Raised at stage 7, deliberately not acted on:**
+
+- **Poison-message *counting* is not implemented and no stage asks for it.**
+  Bounded retry — redeliver a message N times before dead-lettering — is a real
+  production pattern, and `--requeue-poison` deliberately has no cap because
+  "nothing stops it on its own" is the lesson. If it is ever wanted, the hook is
+  `method.redelivered` plus a per-delivery-tag counter, and it belongs nowhere
+  in the current plan.
+- **Nothing consumes `telemetry.dlq`, by design.** Its contents are the
+  evidence. Stages 8 and 9 add to it; nothing drains it but `purge_queue`.
+- **`payload.parse()` is called once per message and rebuilds nothing.** If the
+  1 Hz rate ever rises far enough for validation cost to matter, the check table
+  is a dict of small functions and is the obvious thing to look at. Not a
+  concern at 1–2 Hz.
 
 **Raised at stage 6, deliberately not acted on:**
 
-- **`consumer_store` has no dead-letter behaviour yet** — that is stage 7, and
-  the test asserting malformed payloads are *acked* is meant to be inverted
-  there.
 - **Heartbeat interval is left at pika's negotiated default.** `--ack-delay`
   past that interval reproduces a heartbeat timeout; nothing sets it explicitly,
   which is a gap against the project's explicit-over-inherited rule. Recorded,
@@ -677,6 +866,12 @@ control, malformed-JSON handling, loop shape and reconnect strategy. See
   duplicate demonstration, so **do not let it disappear.**
 - **Stage 11's storage-failure policy** — retry with backoff vs dead-letter after
   N attempts. Left to the user during implementation.
+- **Whether `parse()`'s number tolerance survives InfluxDB's typed fields.**
+  `parse()` accepts a JSON integer for `temp_c` / `humidity_pct`; InfluxDB
+  fields are typed and a float field is expected to reject a later integer.
+  **Not verified** — no InfluxDB before stage 10. Resolve it at stage 11, most
+  likely by coercing with `float()` at the write, which keeps the tolerance a
+  dead-lettering decision rather than a storage one.
 - **InfluxDB and Grafana image tags** — unverified. RabbitMQ's is settled at
   `rabbitmq:4.3-management`.
 - **Grafana healthcheck** — unknown whether `curl` or `wget` exists in that image.

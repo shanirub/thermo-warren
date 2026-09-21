@@ -27,32 +27,35 @@ import json
 import logging
 import sys
 
+from telemetry import payload as contract
 from telemetry import topology_spec as spec
 from telemetry.amqp import run_consumer
 from telemetry.logging_setup import configure_logging
+from telemetry.payload import FIELD_SEQ, ContractViolation
 
 log = logging.getLogger(__name__)
-
-# Only field this consumer reads. It does not validate the rest of the payload
-# contract: this path exists to show what arrived, not to judge it.
-FIELD_SEQ = "seq"
 
 
 def on_message(channel, method, properties, body: bytes) -> None:
     """Log the delivery and return. There is nothing to acknowledge.
 
-    No basic_ack call anywhere in this module, deliberately: the channel uses
-    automatic acknowledgment, so the broker considered this message done the
-    moment it wrote it to the socket. Adding an ack here would raise a channel
-    error rather than being harmlessly redundant.
+    No basic_ack, basic_reject or basic_nack call anywhere in this module,
+    deliberately: the channel uses automatic acknowledgment, so the broker
+    considered this message done the moment it wrote it to the socket. Adding
+    an ack here would raise a channel error rather than being harmlessly
+    redundant, and there is no dead-letter exchange on telemetry.observe to
+    reject into even if there were something to reject.
     """
     try:
-        seq = json.loads(body)[FIELD_SEQ]
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        # Same bytes that dead-letter on the durable path are merely noted
-        # here, because this queue has no dead-letter exchange to send them to.
-        # That contrast is stage 7's demonstration; this line is its other half.
-        log.warning("unparseable payload, logged and dropped: %s", exc)
+        seq = contract.parse(body)[FIELD_SEQ]
+    except (json.JSONDecodeError, ContractViolation) as exc:
+        # The same parse() consumer_store uses, on purpose. The lesson is "same
+        # bytes, two fates", so both consumers must consider the same messages
+        # bad -- only what they *do* about it differs. There the message
+        # dead-letters with an x-death header; here it is noted and gone, and
+        # nothing anywhere records that it existed. That contrast is stage 7's
+        # demonstration, and this line is its other half.
+        log.warning("poison message, logged and dropped: %s", exc)
         return
 
     # seq=<int> as a bare token, so `grep -o 'seq=[0-9]*'` over this log and
