@@ -16,7 +16,7 @@ stage"; a scalar marker cannot describe two tracks.**
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 5** — software publisher, verified. Both consumers (`consumer_observe.py`, `consumer_store.py`) are still stage 2 stubs. |
+| **Software** | **Stage 6** — both consumers real and verified: manual ack and bounded prefetch on the durable path, auto-ack on the lossy one. `stub.py` deleted. |
 | **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
 **The two tracks have now met, and the parallelism ends here.** Hardware is done
@@ -24,15 +24,21 @@ through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
 *both* halves, so it cannot start until software reaches stage 13. There is no
 independent hardware work left to schedule.
 
-Next: **stage 6** on the software track (both consumers, manual ack, bounded
-prefetch), then 7-13. Stage 17's own DoD gets its second half signed off when
-stage 13 lands — the MCU side is already proven and needs no rework for it.
+Next: **stage 7** on the software track (dead-lettering trigger 1: the durable
+consumer rejects unparseable messages without requeueing), then 8-13. Stage 17's
+own DoD gets its second half signed off when stage 13 lands — the MCU side is
+already proven and needs no rework for it.
+
+Stage 7 is a one-line change by construction: `consumer_store`'s parse-failure
+branch already exists and already logs, so `basic_ack` becomes
+`basic_nack(requeue=False)`. The test asserting the current behaviour is meant
+to be inverted, not deleted.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `src/telemetry/` | Python: publisher, consumers, topology, config — see `src/telemetry/CLAUDE.md` |
+| `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP plumbing, config — see `src/telemetry/CLAUDE.md` |
 | `firmware/` | ESP-IDF project for the ESP32-C3 — see `firmware/CLAUDE.md` |
 | `tests/` | pytest, **no broker required** — keep it that way |
 | `compose.yaml` | RabbitMQ, publisher, consumers |

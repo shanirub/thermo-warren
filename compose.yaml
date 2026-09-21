@@ -1,6 +1,9 @@
-# Stage 2: Python services only. RabbitMQ arrives at stage 3, InfluxDB at
-# stage 10, Grafana at stage 12. Nothing here connects to anything yet -- the
-# stubs resolve configuration and exit.
+# Stage 6: broker, publisher and both consumers. InfluxDB arrives at stage 10,
+# Grafana at stage 12.
+#
+# Expected steady state: rabbitmq Up (healthy), and publisher, consumer-observe
+# and consumer-store all Up. Only `topology` exits -- Exited (0), which is the
+# one-shot declarer having done its job and is what the other three gate on.
 #
 # Every service is written out in full, with no YAML anchors. The four blocks
 # differ only in `command`, so the repetition is deliberate: nothing is hidden,
@@ -120,7 +123,10 @@ services:
       RABBITMQ_HOST: rabbitmq
     volumes:
       - ./src:/app/src
-    restart: "no"
+    # Long-lived from stage 6, like publisher. The consumer reconnects to the
+    # broker on its own (amqp.run_consumer), so this policy is for crashes and
+    # daemon restarts, not for broker outages.
+    restart: unless-stopped
     command: ["python", "-m", "telemetry.consumer_observe"]
 
   consumer-store:
@@ -138,7 +144,10 @@ services:
       RABBITMQ_HOST: rabbitmq
     volumes:
       - ./src:/app/src
-    restart: "no"
+    # Long-lived from stage 6, like publisher. --ack-delay is deliberately not
+    # set here: it is a hand-run experiment, so it belongs on a command line,
+    # not in the file that defines steady state.
+    restart: unless-stopped
     command: ["python", "-m", "telemetry.consumer_store"]
 
 volumes:

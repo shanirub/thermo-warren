@@ -286,9 +286,10 @@ def publish_one(
 
     properties = Properties(PacketTypes.PUBLISH)
     properties.ContentType = CONTENT_TYPE_JSON
-    # Whether RabbitMQ's MQTT plugin maps this through to the AMQP
-    # content_type property visible in the management UI is not verified --
-    # set because it is correct MQTT 5, not because a check depends on it.
+    # Verified at stage 17 against a queued MCU message: RabbitMQ's MQTT plugin
+    # does map this through to the AMQP content_type property visible in the
+    # management API. Still nothing depends on it -- it is set because it is
+    # correct MQTT 5, not because a check reads it.
 
     info = client.publish(
         spec.MQTT_TOPIC,
