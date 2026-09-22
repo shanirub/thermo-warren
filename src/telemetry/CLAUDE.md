@@ -7,7 +7,7 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 9 done and verified.** Next is stage 10.
+**Software track state: stage 10 done and verified.** Next is stage 11.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
 the payload contract. **All three dead-letter triggers are now demonstrated** —
@@ -16,6 +16,10 @@ stage 4. `telemetry.store` is back to its baseline of a dead-letter exchange and
 nothing else; stages 8 and 9 each added an argument, measured it, and removed it
 again. Shared AMQP plumbing lives in `amqp.py`; the payload contract lives in
 `payload.py`.
+
+**InfluxDB is up and provisioned but nothing speaks to it yet** — stage 10 added
+a container, not code. `consumer_store` gains the write at stage 11, Grafana the
+read at stage 12.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -41,9 +45,11 @@ again. Shared AMQP plumbing lives in `amqp.py`; the payload contract lives in
   already-validated contract.
 - **Dual run modes**: containerised full stack, and modules runnable directly on
   the host against exposed ports.
-- **InfluxDB 2.x with a pinned tag** (stage 10), not 1.8 and not 3 Core.
-  **InfluxQL, not Flux**, through a DBRP mapping — InfluxQL survives a future
-  move to 3 Core, Flux does not.
+- **`influxdb:2.9`** (stage 10), not 1.8 and not 3 Core. Floating across patch
+  releases exactly like `rabbitmq:4.3-management`. **InfluxQL, not Flux**,
+  through a DBRP mapping — InfluxQL survives a future move to 3 Core, Flux does
+  not. The mapping itself is stage 12's, so stage 10's hand checks are
+  necessarily Flux; that is staging, not a reversal.
 
 ## Where things live
 
@@ -203,8 +209,9 @@ longer only a document.
   field first written as a float rejects a later integer with a field-type
   conflict. The `influxdb-client` mapping from Python `int` is expected to
   produce an integer field, so the tolerance above could let through a value
-  that the write then refuses. Expected, **not checked** — there is no InfluxDB
-  before stage 10. If it holds, stage 11's write coerces with `float()` and the
+  that the write then refuses. Expected, **not checked** — stage 10 brought an
+  InfluxDB up, so this is now testable rather than hypothetical, but nothing
+  writes to it yet. If it holds, stage 11's write coerces with `float()` and the
   tolerance stays purely a dead-lettering decision.
 - **`ts_ms`** — epoch **milliseconds**, publisher-stamped. Milliseconds
   specifically because InfluxDB point identity is measurement + tag set +
@@ -730,6 +737,122 @@ adding a `--overflow` CLI flag** — stage 4 explicitly refused to make topology
 values reachable from outside `topology_spec.py`, and an overflow mode is a
 value where `--recreate` is an operation.
 
+## Storage (stage 10, implemented and verified)
+
+`influxdb:2.9` in `compose.yaml`, provisioned at first start. **No Python was
+written**: this is the first stage in six that adds a container rather than
+changing queue arguments, and `config.py` deliberately did not grow fields.
+
+| Thing | Value |
+|---|---|
+| Image | `influxdb:2.9` (patch `2.9.1` at the time of writing) |
+| Org | `thermo-warren` |
+| Bucket | `telemetry` |
+| Retention | `0` — infinite, stated explicitly |
+| Published port | `127.0.0.1:8086` |
+| Volumes | `influxdb-data` → `/var/lib/influxdb2`, `influxdb-config` → `/etc/influxdb2` |
+
+### Naming
+
+- Org `thermo-warren` mirrors the pinned compose project name, so the org and
+  the volume prefix say the same thing. Bucket `telemetry` joins the
+  `telemetry.store` / `telemetry.observe` family, so one word names the data
+  everywhere.
+- **`.env` keys are prefixed `INFLUXDB_`, deliberately not `INFLUX_`.** The
+  `influx` CLI reads `INFLUX_HOST`, `INFLUX_TOKEN` and `INFLUX_ORG` straight
+  from the environment, so `INFLUX_`-prefixed keys would silently configure any
+  CLI that inherits the `env_file`. `INFLUXDB_` cannot collide.
+
+### Retention is infinite, explicitly
+
+`DOCKER_INFLUXDB_INIT_RETENTION=0`. The entrypoint passes `--retention` **only
+when the variable is non-empty**, so leaving it out would be inheriting the
+default silently rather than choosing it.
+
+Infinite rather than a window **for the stage 8 reason**: `telemetry.observe`
+was given no TTL because it already shed its head at the cap, and a second
+reason for data to vanish makes it impossible to say which one acted. Stage 18
+asks where a message went; an expiring bucket would be a second silent answer.
+A finite retention is the storage-layer echo of stage 8's queue TTL if it is
+ever wanted as its own exercise — **recorded, not scheduled**.
+
+Consequence, accepted: the point written by hand at stage 10 is **permanent**.
+It is named `stage10_check`, not the measurement stage 11 will choose, so it can
+never be mistaken for real telemetry. `influx delete --predicate` removes it.
+
+### One admin token, and why a scoped one was not possible here
+
+`DOCKER_INFLUXDB_INIT_ADMIN_TOKEN` is generated by hand into `.env`
+(`openssl rand -hex 32`) **before the first `up`** — hex rather than base64 so
+the value carries no `/`, `+` or `=` to quote in `.env` or escape into a curl.
+It must exist beforehand because **from 2.9 tokens are hashed on disk and the
+plaintext cannot be recovered**.
+
+A scoped write token for `consumer_store` was considered and rejected for this
+stage. **Verified in the `influx-cli` source: `influx auth create` has no flag
+to supply a token value** — it takes `--read-bucket` / `--write-bucket` /
+`--operator` / `--all-access` and reads `auth.GetToken()` out of the API
+response. Combined with 2.9's hashing, a scoped token is printed exactly once at
+creation and is unrecoverable afterwards, so it cannot be seeded into `.env` the
+way the admin token can. Provisioning one would mean an executable script under
+`/docker-entrypoint-initdb.d` that echoes the token to the container log for a
+human to copy — a manual step in the middle of a stage whose point is
+provisioning at first start.
+
+**This is the deliberate parallel to `iot` still carrying the RabbitMQ
+`administrator` tag** — same shape of compromise, same deferred-hardening note.
+Deferring costs little: a scoped token can be created at any later time with one
+CLI call.
+
+### Healthcheck: `/health`, readiness not liveness
+
+`curl -sf http://localhost:8086/health`.
+
+- **Needs no token**, which the plan demanded — a query-based check would log an
+  authentication failure every interval forever. **Verified: zero `401` or
+  `unauthorized` lines** in the container log across two full starts.
+- `curl` is already in the image (Debian bookworm-slim); nothing is installed.
+- **`/health` returns 200 healthy, 503 unhealthy**, so it maps cleanly onto
+  `curl -f`. **`/ready` has no failure status code in the OSS API spec** and so
+  cannot express "not ready" to a healthcheck at all.
+- **Readiness, the opposite of rabbitmq's deliberately liveness-only check.**
+  Stage 11 gates `consumer-store` on this one, and a socket that merely accepts
+  would not be enough.
+
+### Two volumes, destroyed together
+
+The image declares `VOLUME /var/lib/influxdb2 /etc/influxdb2`. Both are named.
+
+- **Data** holds `influxd.bolt` and the TSM engine. Whether `influxd.bolt`
+  exists is exactly what decides if the setup wrapper runs.
+- **Config** holds `/etc/influxdb2/influx-configs`, where the entrypoint writes
+  the CLI's host and admin token after setup. Left anonymous, a
+  `docker compose down` drops the CLI's credentials into a throwaway volume
+  while the data survives, and in-container `influx` commands then fail for no
+  visible reason.
+
+**Verified**: `docker compose exec influxdb influx bucket list` needs **no
+`--token`**, before and after a `down`/`up`. If it ever asks for one, the
+`influxdb-config` volume is the thing to check — that diagnostic is what the
+second volume buys.
+
+Destroy them together. Data alone and setup re-runs underneath a config that
+already names an org; config alone and setup is skipped while the CLI has no
+token. `down -v` takes both, which is the only always-coherent combination.
+
+### Stage 10 DoD — verified against real behaviour
+
+| Check | Result |
+|---|---|
+| `docker compose up -d --wait` | exit 0, **12.0 s** cold (8.1 s warm), `influxdb` Healthy |
+| Bucket exists | `telemetry`, retention printed as **`infinite`**, org `thermo-warren` |
+| CLI needs no token | `influx bucket list` and `influx org list` both work bare |
+| Write one point by hand | `stage10_check,src=hand value=1` accepted |
+| Query it back | returned with `_value 1`, `_measurement stage10_check` |
+| `down` (no `-v`) then `up` | bucket and point both survive; setup does not re-run |
+| Healthcheck auth noise | **zero** `401`/`unauthorized` lines |
+| Tests still green with no broker | 85/85, unchanged |
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -791,9 +914,11 @@ value where `--recreate` is an operation.
   support ended 31 Jul 2026; 4.3 runs to 30 Nov 2026.
 - **Broker user via `RABBITMQ_DEFAULT_USER`/`PASS`**, not `definitions.json` —
   declarative definitions would collide with the topology-declared-by-code goal.
-- **AMQP and management bound to 127.0.0.1; MQTT is not.** 1883 publishes on
-  `0.0.0.0` from stage 17, because the ESP32 reaches it over the LAN and no
-  narrower binding works. This exposes the `iot` user, which still carries the
+- **AMQP, management and InfluxDB bound to 127.0.0.1; MQTT is not.** 1883
+  publishes on `0.0.0.0` from stage 17, because the ESP32 reaches it over the
+  LAN and no narrower binding works. **8086 stays on loopback** — nothing off
+  this host talks to InfluxDB, since Grafana reaches it over the compose network
+  at stage 12 and the published port exists only for host mode and hand checks. This exposes the `iot` user, which still carries the
   `administrator` tag — the answer to that is the scoped application user in
   "Open questions", not a bind address.
 - **`anonymous_login_user = none`** in `rabbitmq.conf`. `mqtt.allow_anonymous`
@@ -806,6 +931,10 @@ value where `--recreate` is an operation.
   socket — liveness, not correctness.
 - `topology` stays one-shot permanently. `publisher` is long-lived
   (`restart: unless-stopped`) from stage 5.
+- **`influxdb` (stage 10) gates nothing yet** — no `depends_on` points at it,
+  because nothing reads or writes it until stage 11. Its healthcheck was still
+  written as readiness rather than liveness, so that wiring is a one-line change
+  when it lands. Full reasoning in "Storage (stage 10)" above.
 
 ### Running the stack
 
@@ -816,16 +945,20 @@ docker compose logs -f rabbitmq   # follow one service; Ctrl-C detaches the read
 ```
 
 Stopping: **`docker compose stop`** keeps the containers, **`down`** removes them
-but keeps the named volume, **`down -v`** destroys `rabbitmq-data`. Keep `-v` for
-when it is meant — destroying that volume is the only way
-`RABBITMQ_DEFAULT_USER`/`PASS` get re-applied, since they apply solely on first
-boot against an empty data directory.
+but keeps the named volumes, **`down -v`** destroys all three —
+`rabbitmq-data`, `influxdb-data` and `influxdb-config`. Keep `-v` for when it is
+meant: destroying those volumes is the only way
+`RABBITMQ_DEFAULT_USER`/`PASS` and the `DOCKER_INFLUXDB_INIT_*` values get
+re-applied, since both sets apply solely on first boot against an empty data
+directory. Note `-v` is all-or-nothing across services — there is no "reset only
+InfluxDB" short of `docker volume rm` by name.
 
-**Expected steady state at stage 6:** `rabbitmq` Up (healthy), and
-`publisher`, `consumer-observe` and `consumer-store` all Up. **Only `topology`
-is `Exited (0)`** — the one-shot declarer having done its job, which is what the
-other three gate on. Both queues sit near `ready=0` with `consumers=1` each.
-Management UI at `http://localhost:15672`.
+**Expected steady state from stage 10:** `rabbitmq` Up (healthy), `influxdb`
+Up (healthy), and `publisher`, `consumer-observe` and `consumer-store` all Up.
+**Only `topology` is `Exited (0)`** — the one-shot declarer having done its job,
+which is what the other three gate on. Both queues sit near `ready=0` with
+`consumers=1` each. Management UI at `http://localhost:15672`; InfluxDB UI at
+`http://localhost:8086`, logging in with `INFLUXDB_USERNAME`/`_PASSWORD`.
 
 ## Verified broker facts — do not re-search
 
@@ -1050,29 +1183,69 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   `topology` still exits without tripping it — now observed twice, though the
   explanation (its `service_completed_successfully` gate) remains **inferred,
   not verified**.
+- **InfluxDB's entrypoint runs `main()` twice, so `found existing boltdb file,
+  skipping setup wrapper` appears on a genuine first boot as well.** The
+  entrypoint ends with `exec setpriv --reuid=influxdb ... "$BASH_SOURCE"` to
+  drop from root, and the re-exec re-enters `main()` — by which point setup has
+  already created the bolt file. **That log line is therefore not the
+  first-boot marker it looks like.** Measured: **first boot logs it once**
+  alongside `Executing user-provided scripts` and `initialization complete`;
+  **a restart logs it twice with neither of those**. Count the setup markers,
+  not the skip line.
+- **InfluxDB's `DOCKER_INFLUXDB_INIT_*` variables apply only on first boot
+  against an empty data volume** — the same trap as
+  `RABBITMQ_DEFAULT_USER`/`PASS`, and for the same reason. Editing the org,
+  bucket, retention or token later changes nothing until `influxdb-data` is
+  destroyed.
+- **First start is two-phase and 8086 does not listen during it.** The
+  entrypoint boots a temporary `influxd` on port 9999 (`INFLUXD_INIT_PORT`),
+  runs `influx setup` against it, kills it, then starts the real server. A
+  healthcheck against 8086 therefore needs a `start_period` covering a startup
+  *sequence*, not merely a slow boot. 30 s is comfortable — the measured cold
+  `up -d --wait` was 12 s.
 
-## Check first at stage 10
+## Check first at stage 11
 
-**Stage 10 is the first stage in six that adds a container rather than changing
-queue arguments.** No `--recreate`, no 406, no dead-letter behaviour. The broker
-half is finished: all three death reasons are demonstrated and
-`telemetry.store` is back to its baseline.
+**Stage 11 is the first stage since 7 that writes Python against a live
+dependency.** It inserts the InfluxDB write between the parse and the ack in
+`consumer_store.build_handler()`, where a comment already marks the spot.
 
-**The plan's own warnings for stage 10**, worth re-reading before starting:
-capture the InfluxDB admin token into the secrets file **before first startup**
-— from 2.9 onward tokens are hashed on disk and the plaintext cannot be
-recovered — and use a healthcheck that needs no token, or every interval logs an
-authentication failure.
+**`config.py` grows its InfluxDB fields here, not at stage 10.** The keys
+already exist in `.env` and `.env.example` (`INFLUXDB_URL`, `_ORG`, `_BUCKET`,
+`_TOKEN`); the class does not. `INFLUXDB_USERNAME`/`_PASSWORD` never become
+fields — they are the admin UI login, interpolated by compose only.
+`pyproject.toml` gains `influxdb-client`, so **run `docker compose build`
+explicitly** afterwards; `up -d <service>` will silently reuse the old image.
 
-**Carried open questions that stage 10 touches**: the InfluxDB image tag is
-unverified (RabbitMQ's is settled at `rabbitmq:4.3-management`), and whether
-`curl` or `wget` exists in the Grafana image is unknown, which matters at stage
-12 rather than 10.
+**`compose.yaml` gains the `depends_on` wiring at stage 11**, not before.
+`influxdb` currently gates nothing, which is why its healthcheck was written as
+readiness rather than liveness.
 
-**`.env.example` will need the InfluxDB keys** when `config.py` grows them.
-That file drifted once already, between stages 5 and 6.
+**Four things already measured that constrain stage 11's design:**
+
+- **A queue TTL does not touch unacknowledged messages** (stage 8) — a consumer
+  holding messages through a storage outage will not lose them to expiry, which
+  removes one failure mode from the design space.
+- **Shutdown takes `prefetch x callback duration`** (stage 8). With
+  `consumer_prefetch_count = 10` and compose's 10 s SIGTERM grace, any retry
+  loop slower than ~1 s per message cannot finish before SIGKILL. **Decide this
+  deliberately.**
+- **A blocking call in the pika callback stalls the I/O loop.** Three
+  consecutive 35 s sleeps did *not* trip a heartbeat disconnect, so the
+  threshold is above 35 s — but it is unmeasured, and `--ack-delay` can
+  reproduce the hazard on demand.
+- **Prefetch is the duplicate window.** An unclean crash redelivers 10.
+
+**Still open and now resolvable**, since an InfluxDB finally exists: whether
+`parse()`'s tolerance of a JSON integer for `temp_c` / `humidity_pct` survives
+InfluxDB's typed fields. See "Open questions".
 
 ## Open questions
+
+**All stage 10 questions are answered**, and all four were decided in
+conversation rather than unilaterally: the org/bucket/prefix naming, the
+retention value, whether `config.py` grows fields at 10 or 11, and the token
+model. Each is recorded with its reasoning in "Storage (stage 10)" above.
 
 **All stage 6-9 questions are answered.** Stage 9's three were decided without
 consultation and are flagged as such in "Overflow (stage 9)" above — the cap
@@ -1128,11 +1301,16 @@ where the contract lives, how strict the type check is. None is open.
 - **Whether `parse()`'s number tolerance survives InfluxDB's typed fields.**
   `parse()` accepts a JSON integer for `temp_c` / `humidity_pct`; InfluxDB
   fields are typed and a float field is expected to reject a later integer.
-  **Not verified** — no InfluxDB before stage 10. Resolve it at stage 11, most
-  likely by coercing with `float()` at the write, which keeps the tolerance a
-  dead-lettering decision rather than a storage one.
-- **InfluxDB and Grafana image tags** — unverified. RabbitMQ's is settled at
-  `rabbitmq:4.3-management`.
-- **Grafana healthcheck** — unknown whether `curl` or `wget` exists in that image.
-- **Optional hardening, not scheduled** — `iot` carries the `administrator` tag.
-  Splitting a human admin from a scoped application user was raised and deferred.
+  **Still not verified, but now testable** — stage 10 gave the project a live
+  InfluxDB. Resolve it at stage 11, most likely by coercing with `float()` at
+  the write, which keeps the tolerance a dead-lettering decision rather than a
+  storage one.
+- **Grafana image tag** — unverified, and its healthcheck with it: unknown
+  whether `curl` or `wget` exists in that image. Matters at stage 12. InfluxDB's
+  is now settled at `influxdb:2.9`, alongside `rabbitmq:4.3-management`, and
+  `curl` is confirmed present in the InfluxDB image.
+- **Optional hardening, not scheduled — now in two places.** `iot` carries the
+  RabbitMQ `administrator` tag, and `consumer_store` will hold the InfluxDB
+  **admin** token at stage 11 rather than a bucket-scoped write token. Both were
+  raised and deferred deliberately; see "One admin token" above for why a scoped
+  token cannot simply be pre-seeded the way the admin one can.

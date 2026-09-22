@@ -96,7 +96,14 @@ class Settings(BaseSettings):
 
     # --- Later stages ------------------------------------------------------
     # Topology names and queue arguments              -> topology_spec.py
-    # InfluxDB url / org / bucket / token             -> stage 10
+    # InfluxDB url / org / bucket / token             -> stage 11
+    #
+    # Stage 11, not stage 10: the container arrives at 10 but nothing Python
+    # reads it until consumer_store writes. A required field here would make
+    # topology, publisher and consumer_observe refuse to start without a
+    # database token none of them touches. INFLUXDB_USERNAME/_PASSWORD never
+    # become fields at all -- they are the admin UI login, interpolated by
+    # compose only, the same asymmetry RABBITMQ_VHOST carries in .env.
 
     @property
     def amqp_url(self) -> str:
