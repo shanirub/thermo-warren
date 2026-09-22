@@ -14,6 +14,8 @@ case the test should be updated deliberately, not deleted.
 import itertools
 import json
 
+import pytest
+
 from telemetry import publisher as pub
 
 
@@ -100,3 +102,52 @@ def test_drift_simulator_moves_by_at_most_one_unit_per_step():
         assert abs(temp_c - prev_temp) <= 1
         assert abs(humidity_pct - prev_humidity) <= 1
         prev_temp, prev_humidity = temp_c, humidity_pct
+
+
+# --- Stage 8: per-message TTL via MQTT 5 -------------------------------------
+
+
+def test_message_expiry_is_absent_by_default():
+    assert pub.build_parser().parse_args([]).message_expiry is None
+
+
+def test_message_expiry_rejects_a_non_positive_value():
+    with pytest.raises(SystemExit):
+        pub.build_parser().parse_args(["--message-expiry", "0"])
+
+
+def test_message_expiry_is_attached_to_the_published_properties():
+    # RabbitMQ turns this MQTT 5 property into a per-message TTL in
+    # milliseconds -- verified in mc_mqtt. Whole seconds is the finest
+    # granularity an MQTT publisher can express.
+    captured = {}
+
+    class FakeClient:
+        def publish(self, topic, payload, qos, properties):
+            captured["properties"] = properties
+            captured["qos"] = qos
+            info = type("Info", (), {"mid": 1})()
+            return info
+
+    state = pub.ClientState()
+    pub.publish_one(
+        FakeClient(), state, 1, pub.DriftSimulator(), None, message_expiry=30
+    )
+
+    assert captured["properties"].MessageExpiryInterval == 30
+    assert captured["qos"] == 1
+
+
+def test_no_expiry_property_when_the_flag_is_unset():
+    # The queue's own x-message-ttl still applies; the point is that this
+    # publisher adds nothing per-message unless asked.
+    captured = {}
+
+    class FakeClient:
+        def publish(self, topic, payload, qos, properties):
+            captured["properties"] = properties
+            return type("Info", (), {"mid": 1})()
+
+    pub.publish_one(FakeClient(), pub.ClientState(), 1, pub.DriftSimulator(), None)
+
+    assert not hasattr(captured["properties"], "MessageExpiryInterval")

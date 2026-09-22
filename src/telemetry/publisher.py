@@ -266,6 +266,7 @@ def publish_one(
     seq: int,
     drift: DriftSimulator,
     corrupt_every: int | None,
+    message_expiry: int | None = None,
 ) -> mqtt.MQTTMessageInfo:
     temp_c, humidity_pct = drift.step()
     payload = build_payload(seq, temp_c, humidity_pct, now_ms())
@@ -277,6 +278,19 @@ def publish_one(
 
     properties = Properties(PacketTypes.PUBLISH)
     properties.ContentType = CONTENT_TYPE_JSON
+
+    if message_expiry is not None:
+        # MQTT 5 Message Expiry Interval, in WHOLE SECONDS. RabbitMQ's MQTT
+        # plugin converts it to a per-message TTL in milliseconds -- verified
+        # in mc_mqtt (rabbitmq_mqtt-4.3.6), which does
+        # `'Message-Expiry-Interval' := Seconds -> ttl => timer:seconds(Seconds)`.
+        # So this is the AMQP `expiration` property by another name, and one
+        # second is the finest granularity reachable from an MQTT publisher.
+        #
+        # Per-message TTL is evaluated only when a message reaches the head of
+        # the queue, so a short expiry set here can be outlived by whatever sits
+        # in front of it. That is stage 8's demonstration, not a bug.
+        properties.MessageExpiryInterval = message_expiry
     # Verified at stage 17 against a queued MCU message: RabbitMQ's MQTT plugin
     # does map this through to the AMQP content_type property visible in the
     # management API. Still nothing depends on it -- it is set because it is
@@ -300,12 +314,13 @@ def run_steady(
     stop_event: threading.Event,
     drift: DriftSimulator,
     corrupt_every: int | None,
+    message_expiry: int | None = None,
 ) -> None:
     interval = settings.publish_interval_seconds
     for seq in sequence_numbers():
         if stop_event.is_set():
             break
-        publish_one(client, state, seq, drift, corrupt_every)
+        publish_one(client, state, seq, drift, corrupt_every, message_expiry)
         # Doubles as the sleep and the early-exit check: a signal during the
         # wait returns immediately instead of finishing out the interval.
         stop_event.wait(interval)
@@ -317,6 +332,7 @@ def run_burst(
     drift: DriftSimulator,
     corrupt_every: int | None,
     count: int,
+    message_expiry: int | None = None,
 ) -> None:
     """Publish `count` messages as fast as possible, then wait for delivery.
 
@@ -326,7 +342,7 @@ def run_burst(
     they just hadn't been confirmed yet. wait_for_publish() closes that gap.
     """
     published = [
-        (seq, publish_one(client, state, seq, drift, corrupt_every))
+        (seq, publish_one(client, state, seq, drift, corrupt_every, message_expiry))
         for seq in range(1, count + 1)
     ]
 
@@ -375,6 +391,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="publish N messages as fast as possible, ignoring the rate "
         "setting, wait for delivery, then exit",
     )
+    parser.add_argument(
+        "--message-expiry",
+        type=_positive_int,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "set the MQTT 5 Message Expiry Interval on every message, which "
+            "RabbitMQ turns into a per-message TTL. Whole seconds only. Stage "
+            "8 uses it to show that a per-message TTL is evaluated at the head "
+            "of the queue, so a short expiry can be outlived by what sits in "
+            "front of it"
+        ),
+    )
     return parser
 
 
@@ -383,6 +412,14 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
 
     log.info("resolved configuration:\n%s", settings.describe())
+
+    if args.message_expiry is not None:
+        log.warning(
+            "--message-expiry %ds: every message carries a per-message TTL. "
+            "The queue's own x-message-ttl still applies, and the effective "
+            "deadline is expected to be the lower of the two.",
+            args.message_expiry,
+        )
 
     state = ClientState()
     client = build_client(state)
@@ -411,9 +448,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.burst is not None:
-            run_burst(client, state, drift, args.corrupt_every, args.burst)
+            run_burst(
+                client, state, drift, args.corrupt_every, args.burst,
+                args.message_expiry,
+            )
         else:
-            run_steady(client, state, stop_event, drift, args.corrupt_every)
+            run_steady(
+                client, state, stop_event, drift, args.corrupt_every,
+                args.message_expiry,
+            )
     finally:
         client.disconnect()
         client.loop_stop()

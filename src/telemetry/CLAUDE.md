@@ -7,11 +7,12 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 7 done and verified.** Next is stage 8.
+**Software track state: stage 8 done and verified.** Next is stage 9.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
-the payload contract. Shared AMQP plumbing lives in `amqp.py`; the payload
-contract lives in `payload.py`.
+the payload contract. `telemetry.store` also carries a 30 s `x-message-ttl`, so
+the **broker** dead-letters messages nobody rejected. Shared AMQP plumbing lives
+in `amqp.py`; the payload contract lives in `payload.py`.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -110,11 +111,16 @@ workarounds would land in the ESP32's credentials at stage 17.
 - **`x-queue-type: classic` stated explicitly on all three**, though it is the
   4.3 default. Documents the classic-vs-quorum decision and immunises against a
   vhost- or policy-level default changing underneath.
-- **`telemetry.store` baseline: `x-dead-letter-exchange` only.** No
-  `x-message-ttl` (stage 8), no `x-max-length` (stage 9). Declaring them early
-  with permissive values was considered and rejected — 406 fires on *any*
-  argument difference, so it would muddy stages 8 and 9 for no gain. The
-  destructive redeclare is unavoidable.
+- **`telemetry.store`: `x-dead-letter-exchange` and, from stage 8,
+  `x-message-ttl: 30_000`.** Still no `x-max-length` — that is stage 9's, and
+  stage 9 **clears the TTL** when it lands, so the two never apply at once.
+  Declaring them early with permissive values was considered and rejected — 406
+  fires on *any* argument difference, so it would muddy stages 8 and 9 for no
+  gain. The destructive redeclare is unavoidable.
+- **`telemetry.observe` has no TTL**, deliberately. It already sheds its head at
+  the cap, and a second reason for a message to vanish there would make it
+  impossible to say which one acted. The DLQ has none either — its contents are
+  the evidence.
 - **`telemetry.observe`: `x-max-length: 100`, `x-overflow: drop-head`, both
   explicit.** 100 because at 1 Hz it fills in ~100 s — long enough to watch the
   cap arrive, short enough to eyeball which `seq` values survived. `drop-head`
@@ -513,6 +519,124 @@ dead-lettered once immediately with a complete `x-death`.
 Note `x-death`'s `count` read **1**, not 58,733: it counts **deaths, not
 deliveries**. A requeue is not a death.
 
+## Expiry (stage 8, implemented and verified)
+
+`telemetry.store` carries **`x-message-ttl: 30_000`**. The contrast against
+stage 7 is the whole point: those deaths needed a consumer to decide something,
+these happen with **no consumer attached at any point**. Same DLQ, same
+`x-death` shape, `reason: expired` rather than `rejected`.
+
+**The DLQ now holds two populations** distinguishable only by that field — and
+the stage 8 ones are *perfectly valid messages*. Nothing was wrong with them;
+they only waited too long.
+
+### Why 30 s
+
+With no consumer, ready count plateaus at roughly **publish rate x TTL** while
+the DLQ grows linearly, which makes the result a number you can predict rather
+than "stuff moved". **Measured**: `telemetry.store` climbed and held at **59-61**
+with both publishers running (~2/s x 30 s = 60), while the DLQ grew ~2/s, for
+108 s with `consumers=0` throughout.
+
+30 s is also an order of magnitude above the 2-4 s consumer restarts measured at
+stages 6 and 7, so a routine restart never dead-letters live data and the DLQ
+stays clean evidence. Stage 9 removes it again.
+
+### The 406, finally exercised
+
+`EXIT_MISMATCH` (4) was written at stage 4 and had **never been triggered by a
+real argument mismatch** until this stage. It works. A plain declare against the
+old arguments exits 4 and quotes RabbitMQ verbatim:
+
+```
+PRECONDITION_FAILED - inequivalent arg 'x-message-ttl' for queue
+'telemetry.store' in vhost '/': received the value '30000' of type
+'signedint' but current is none
+```
+
+**Note the knock-on**: until `--recreate` is run, `docker compose up -d --wait`
+fails with `service "topology" didn't complete successfully: exit 4`, because
+the one-shot declarer hits the same mismatch. That is correct behaviour, not a
+broken stack — the gate is doing its job.
+
+### Per-message TTL, and what the head-of-queue rule really means
+
+**MQTT 5's Message Expiry Interval is RabbitMQ's per-message TTL.** Recovered
+from the compiled plugin (`mc_mqtt`, `rabbitmq_mqtt-4.3.6`):
+
+```erlang
+#{'Message-Expiry-Interval' := Seconds} -> Anns0#{ttl => timer:seconds(Seconds), ...
+```
+
+So `publisher.py --message-expiry SECONDS` reaches it, and **no separate AMQP
+publishing path is needed**. MQTT carries whole **seconds**, RabbitMQ stores
+**milliseconds** — one second is the finest granularity from an MQTT publisher.
+**Confirmed on the wire**: a message published with `--message-expiry 2` shows
+`expiration=2000` in the management API, next to MCU messages showing none.
+
+**What is actually being demonstrated is not two mechanisms.** Queue-level and
+per-message TTL both expire lazily from the head. A uniform queue-level TTL plus
+FIFO ordering means the head is always both the oldest message *and* the
+earliest to expire, so head-first expiry is always correct. Non-uniform
+per-message TTLs break that correspondence — and only then can a message outlive
+its own deadline.
+
+**Both halves measured:**
+
+| Setup | Result |
+|---|---|
+| 2 s expiry, **at the head** (purge→publish in 2 ms) | died at **exactly t=2.0 s** |
+| 2 s expiry, **behind 30 s messages** | survived to **~30 s** — 15x its own deadline |
+
+The second one was nearly misread. With the MCU publishing at 1 Hz, a
+`docker compose run` publisher takes ~3 s to start, so MCU messages always land
+at the head first — which reproduces the lingering *accidentally* and looks
+identical to the expiry property never being set. Distinguishing them needed the
+`expiration=2000` evidence above. **If you re-run this, publish from a process
+that is already connected**, or you are not testing what you think.
+
+### min(queue TTL, per-message TTL) — verified both ways
+
+No longer an assumption:
+
+| Per-message | Queue | Expired at |
+|---|---|---|
+| 2 s | 30 s | **2 s** |
+| 60 s | 30 s | **30 s** |
+
+The lower of the two wins in both directions.
+
+### The TTL does not touch unacknowledged messages
+
+**Measured, and it matters at stage 11**: with `--ack-delay 35` (above the 30 s
+TTL), `messages_unacknowledged` held at exactly **10** for 88 s — nearly three
+TTLs — while ready messages kept expiring into the DLQ around them.
+
+Once a message is delivered to a consumer it is out of the queue's expiry reach.
+A consumer holding messages through a storage outage will **not** lose them to
+the TTL, which removes one failure mode from stage 11's design space.
+
+Incidentally: three consecutive 35 s blocking sleeps inside the pika callback
+did **not** trip a heartbeat disconnect. The hazard recorded at stage 6 is real
+but the threshold is higher than 35 s.
+
+### A slow callback makes shutdown take prefetch x delay
+
+Found by accident at stage 8, and it matters at stage 11. A consumer running
+`--ack-delay 35` did not exit on SIGINT for minutes. It was not hung: the 10
+messages already buffered locally by the prefetch are still dispatched to the
+callback one at a time before `start_consuming()` can return, so worst-case
+shutdown is **`consumer_prefetch_count` x callback duration** — here 10 x 35 s.
+
+The production consequence: compose sends SIGTERM and waits **10 s** before
+SIGKILL. Any callback slow enough to matter, with a prefetch of 10, cannot
+finish draining in 10 s, so `docker compose stop` will always end in a SIGKILL
+and an unclean stop. Nothing is lost — unacknowledged messages return to ready —
+but every stop looks like a crash. **Stage 11 should decide deliberately**
+whether to shorten the prefetch, bound the write, or raise
+`stop_grace_period`, rather than discovering this when the storage write turns
+out to be slow.
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -542,7 +666,7 @@ deliveries**. A requeue is not a death.
 - **Exit codes:** `0` clean/declared, `2` broker unreachable, `3` auth or
   permissions rejected, `4` argument mismatch or other channel error. SIGTERM and
   SIGINT are handled for a clean disconnect, since compose sends SIGTERM.
-- **Tests must pass with no broker running.** 78/78 at stage 7, across
+- **Tests must pass with no broker running.** 84/84 at stage 8, across
   `test_topology.py`, `test_publisher.py`, `test_consumers.py` and
   `test_payload.py`. The last two are split on purpose: `test_payload.py`
   asserts what `parse()` accepts and rejects, `test_consumers.py` asserts what
@@ -654,6 +778,18 @@ Management UI at `http://localhost:15672`.
   acknowledgement itself may have been lost. Republishing manufactures
   duplicates. This is at-least-once, and it is why `seq` exists in the payload.
 
+**Reading the broker's own Erlang** (stage 8)
+
+- **`strings` is not installed in the broker image**, and beam atom tables are
+  compressed so copying a `.beam` out and running `strings` locally finds almost
+  nothing either.
+- **`rabbitmqctl eval` with `beam_lib` is the way.** Atom table:
+  `beam_lib:chunks(code:which(Mod),[atoms])`. Full source, where debug info
+  survives: `beam_lib:chunks(code:which(Mod),[abstract_code])` piped through
+  `erl_prettypr:format(erl_syntax:form_list(AC))`. That is how the MQTT expiry
+  mapping above was established rather than guessed. Core broker modules such as
+  `rabbit_variable_queue` are stripped; plugin modules like `mc_mqtt` are not.
+
 **AMQP consumers** (verified at stage 6)
 
 - **RabbitMQ sends `Basic.Cancel` to a consumer whose queue is deleted.**
@@ -711,8 +847,20 @@ Management UI at `http://localhost:15672`.
   the default is stated explicitly.
 - `reject-publish-dlx` is **classic-queue only**.
 - **Per-message TTL only takes effect once a message reaches the head of the
-  queue**, so an expired message behind a long-lived one lingers past its
-  deadline. Queue-level TTL does not behave this way.
+  queue** — **measured at stage 8**: 2 s at the head died at 2.0 s; the same 2 s
+  behind 30 s messages survived ~30 s. Queue-level TTL appears not to behave
+  this way only because a uniform TTL plus FIFO makes head-first expiry always
+  correct; the machinery is the same.
+- **The effective deadline is `min(queue TTL, per-message TTL)`** — verified
+  both directions at stage 8 (2 s under a 30 s queue expired at 2 s; 60 s under
+  a 30 s queue expired at 30 s).
+- **A TTL never applies to unacknowledged messages.** Verified at stage 8:
+  unacked held at 10 for 88 s against a 30 s TTL while ready messages expired
+  around them. Delivery takes a message out of the queue's expiry reach.
+- **MQTT 5's Message Expiry Interval becomes the per-message TTL.** `mc_mqtt`
+  does `'Message-Expiry-Interval' := Seconds -> ttl => timer:seconds(Seconds)`;
+  MQTT carries seconds, RabbitMQ stores milliseconds, and it surfaces as the
+  AMQP `expiration` property (`expiration=2000` observed for a 2 s expiry).
 - **Redeclaring a queue with different arguments raises 406 rather than updating
   it.** Since stages 8 and 9 change queue arguments, destructive redeclare had to
   be supported from the start.
@@ -804,29 +952,36 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   explanation (its `service_completed_successfully` gate) remains **inferred,
   not verified**.
 
-## Check first at stage 8
+## Check first at stage 9
 
-**Stage 8 adds `x-message-ttl` to `telemetry.store` and needs `--recreate`**,
-which deletes and redeclares both main queues. Consumers attached at the time
-get a `Basic.Cancel` and reattach on their own — verified at stage 6 — so this
-is safe to run with the stack up, but expect the ERROR line and do not read it
-as a fault.
+**Stage 9 clears the TTL and adds `x-max-length`.** Both are `STORE_ARGS`
+changes, so it is another 406 and another `--recreate` — and remember the plain
+`up -d --wait` will fail with `topology ... exit 4` until you run it.
 
-**The DLQ survives `--recreate` by design** and is not purged by it. Anything
-stage 7 put there is still there, and stage 8's expired messages will land
-alongside it. Purge it first if you want a clean count, and remember
-`purge_queue` is per queue and not atomic.
+**The DLQ will then hold three populations**, distinguishable only by
+`x-death.reason`: `rejected` from stage 7, `expired` from stage 8, and `maxlen`
+from stage 9. The `expired` population stops growing the moment the TTL is
+cleared. Purge before counting, or the three mix.
 
-**Death reason is how you tell stage 7 and stage 8 apart in the DLQ**:
-`rejected` came from the consumer, `expired` came from the TTL with no consumer
-involved at all. Stage 8's DoD is precisely that the second happens with
-`consumer_store` stopped.
+**`--message-expiry` still works after the queue TTL is gone**, and with no
+queue TTL to cap it, a per-message expiry becomes the only deadline — which
+makes the head-of-queue effect easier to demonstrate at longer timescales than
+stage 8 could.
 
-**Two publishers are live whenever the MCU is powered** — the simulator
-(`device=sim-01`, `seq` from 1) and the MCU (`device=esp32c3-01`, `seq` in the
-tens of thousands). Only the simulator can produce malformed traffic.
+**Two publishers are live whenever the MCU is powered.** Only the simulator can
+set `--message-expiry`; MCU messages carry no `expiration`, which is exactly why
+they were the ones sitting at the head during stage 8's demonstration. A
+`docker compose run` publisher takes ~3 s to start, so **the MCU always wins the
+head** — publish from an already-connected process when queue order matters.
 
 ## Open questions
+
+**All stage 6, 7 and 8 questions are answered.** Stage 8: the TTL value, and
+how to demonstrate the head-of-queue rule.
+
+**Stage 8 closed two things that had been carried as unknown:** whether
+`min(queue TTL, per-message TTL)` holds (it does, both ways) and whether a TTL
+touches unacknowledged messages (it does not).
 
 **All stage 6 and stage 7 questions are answered.** Stage 6: ack mode, prefetch
 value, ack-delay control, malformed-JSON handling, loop shape, reconnect. Stage
@@ -850,11 +1005,12 @@ where the contract lives, how strict the type check is. None is open.
 
 **Raised at stage 6, deliberately not acted on:**
 
-- **Heartbeat interval is left at pika's negotiated default.** `--ack-delay`
-  past that interval reproduces a heartbeat timeout; nothing sets it explicitly,
-  which is a gap against the project's explicit-over-inherited rule. Recorded,
+- **Heartbeat interval is left at pika's negotiated default.** Nothing sets it
+  explicitly, which is a gap against the explicit-over-inherited rule. Recorded,
   not fixed — stage 11 is where a blocking call in the callback stops being
-  hypothetical.
+  hypothetical. **Stage 8 narrowed the risk**: three consecutive 35 s blocking
+  sleeps inside the callback did not trip a disconnect, so the threshold is
+  above 35 s. Where exactly is still unmeasured.
 - **`run_consumer()` takes no "drain and exit" mode.** Not needed by any stage
   so far; noted because stage 18 might want one.
 

@@ -16,7 +16,7 @@ stage"; a scalar marker cannot describe two tracks.**
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 7** — dead-lettering by rejection, verified. `consumer_store` rejects anything failing the payload contract without requeueing; the payload contract now lives in `payload.py`. |
+| **Software** | **Stage 8** — both dead-letter triggers so far verified: rejection (stage 7, consumer-driven) and expiry (stage 8, a 30 s `x-message-ttl` the broker enforces with no consumer at all). |
 | **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
 **The two tracks have now met, and the parallelism ends here.** Hardware is done
@@ -24,9 +24,9 @@ through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
 *both* halves, so it cannot start until software reaches stage 13. There is no
 independent hardware work left to schedule.
 
-Next: **stage 8** on the software track (dead-lettering trigger 2: a short
-message TTL on `telemetry.store`, which needs a destructive redeclare), then
-9-13. Stage 17's own DoD gets its second half signed off when stage 13 lands —
+Next: **stage 9** on the software track (dead-lettering trigger 3: clear the
+TTL, add a small `x-max-length`, and contrast oldest-out against newest-out),
+then 10-13. Stage 17's own DoD gets its second half signed off when stage 13 lands —
 the MCU side is already proven and needs no rework for it.
 
 **A note on predicting the next stage.** Stage 6 recorded here that "stage 7 is

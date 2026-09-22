@@ -70,15 +70,38 @@ def test_observation_queue_is_bounded_and_evicts_the_oldest():
     assert args["x-overflow"] == "drop-head"
 
 
-def test_durable_queue_carries_no_ttl_or_length_cap_yet():
-    # Those arrive at stages 8 and 9. Adding them early would collapse the
-    # stages and teach nothing about the redeclare error.
+def test_durable_queue_expires_messages_but_has_no_length_cap_yet():
+    # Half-inverted at stage 8, the same way stage 7 inverted its own stage 6
+    # test. The TTL arrived here; x-max-length is still stage 9's, and stage 9
+    # clears the TTL when it lands, so the two never apply at once.
     channel = MagicMock()
     declare(channel)
     args = declared_queues(channel)[spec.QUEUE_STORE]["arguments"]
 
-    assert "x-message-ttl" not in args
+    assert args["x-message-ttl"] == spec.STORE_MESSAGE_TTL_MS
     assert "x-max-length" not in args
+
+
+def test_only_the_durable_queue_expires_messages():
+    # The asymmetry is the design. telemetry.observe already sheds its head at
+    # the cap; a second reason for a message to vanish there would make it
+    # impossible to say which one acted. The DLQ must never expire anything --
+    # its contents are the evidence.
+    channel = MagicMock()
+    declare(channel)
+    args = {q: kw["arguments"] for q, kw in declared_queues(channel).items()}
+
+    assert "x-message-ttl" in args[spec.QUEUE_STORE]
+    assert "x-message-ttl" not in args[spec.QUEUE_OBSERVE]
+    assert "x-message-ttl" not in args[spec.QUEUE_DLQ]
+
+
+def test_the_ttl_is_far_above_a_consumer_restart():
+    # 30s was chosen so a routine restart -- measured at 2-4s across stages 6
+    # and 7 -- can never dead-letter live data, which keeps the DLQ clean
+    # evidence for stages 8 and 9. A value near the restart time would make
+    # every dead-letter ambiguous.
+    assert spec.STORE_MESSAGE_TTL_MS >= 10_000
 
 
 def test_every_queue_is_durable_and_explicitly_classic():

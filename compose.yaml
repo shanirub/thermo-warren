@@ -1,5 +1,6 @@
-# Stage 6: broker, publisher and both consumers. InfluxDB arrives at stage 10,
-# Grafana at stage 12.
+# Broker, publisher and both consumers. The service set has been stable since
+# stage 6; stages 7-9 change queue arguments and consumer behaviour, not this
+# file. InfluxDB arrives at stage 10, Grafana at stage 12.
 #
 # Expected steady state: rabbitmq Up (healthy), and publisher, consumer-observe
 # and consumer-store all Up. Only `topology` exits -- Exited (0), which is the
