@@ -70,37 +70,45 @@ def test_observation_queue_is_bounded_and_evicts_the_oldest():
     assert args["x-overflow"] == "drop-head"
 
 
-def test_durable_queue_expires_messages_but_has_no_length_cap_yet():
-    # Half-inverted at stage 8, the same way stage 7 inverted its own stage 6
-    # test. The TTL arrived here; x-max-length is still stage 9's, and stage 9
-    # clears the TTL when it lands, so the two never apply at once.
+def test_durable_queue_is_back_to_its_baseline():
+    # Third stage running where a test written to be changed gets changed
+    # rather than deleted. Stage 8 put a TTL here and stage 9 a length cap;
+    # both were demonstrated and then removed, because the plan calls for
+    # returning to steady-state settings once the lesson is recorded. What
+    # survives all of them is the dead-letter exchange.
     channel = MagicMock()
     declare(channel)
     args = declared_queues(channel)[spec.QUEUE_STORE]["arguments"]
 
-    assert args["x-message-ttl"] == spec.STORE_MESSAGE_TTL_MS
+    assert args["x-dead-letter-exchange"] == spec.DLX
+    assert "x-message-ttl" not in args
     assert "x-max-length" not in args
 
 
-def test_only_the_durable_queue_expires_messages():
-    # The asymmetry is the design. telemetry.observe already sheds its head at
-    # the cap; a second reason for a message to vanish there would make it
-    # impossible to say which one acted. The DLQ must never expire anything --
-    # its contents are the evidence.
-    channel = MagicMock()
-    declare(channel)
-    args = {q: kw["arguments"] for q, kw in declared_queues(channel).items()}
+def test_the_overflow_constants_are_the_two_modes_that_dead_letter():
+    # The trap this guards: plain "reject-publish" discards WITHOUT
+    # dead-lettering, and its name reads like the safer of the two. If someone
+    # later "simplifies" either constant to it, the evidence this project is
+    # built to read stops appearing and nothing else fails.
+    assert spec.STORE_OVERFLOW_OLDEST_OUT == "drop-head"
+    assert spec.STORE_OVERFLOW_NEWEST_OUT == "reject-publish-dlx"
+    assert "reject-publish" != spec.STORE_OVERFLOW_OLDEST_OUT
+    assert "reject-publish" != spec.STORE_OVERFLOW_NEWEST_OUT
+    assert spec.OBSERVE_OVERFLOW != "reject-publish"
 
-    assert "x-message-ttl" in args[spec.QUEUE_STORE]
-    assert "x-message-ttl" not in args[spec.QUEUE_OBSERVE]
-    assert "x-message-ttl" not in args[spec.QUEUE_DLQ]
+
+def test_the_two_bounded_queues_do_not_share_one_cap():
+    # Different numbers on purpose: two bounded queues running the same value
+    # would read as a project convention rather than two separate policies
+    # chosen for two different reasons.
+    assert spec.STORE_MAX_LENGTH != spec.OBSERVE_MAX_LENGTH
 
 
 def test_the_ttl_is_far_above_a_consumer_restart():
-    # 30s was chosen so a routine restart -- measured at 2-4s across stages 6
-    # and 7 -- can never dead-letter live data, which keeps the DLQ clean
-    # evidence for stages 8 and 9. A value near the restart time would make
-    # every dead-letter ambiguous.
+    # Retained though the TTL is no longer applied: the value is kept in the
+    # spec so stage 8's experiment is one edit away, and the reasoning behind
+    # it should not rot. 30s was chosen so a routine restart -- measured at
+    # 2-4s across stages 6 and 7 -- can never dead-letter live data.
     assert spec.STORE_MESSAGE_TTL_MS >= 10_000
 
 

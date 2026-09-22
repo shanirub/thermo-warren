@@ -28,7 +28,7 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 8, so there are consumers now
+reachable yet** — the software track is at stage 9, so there are consumers now
 but still no InfluxDB and no dashboard. Sign that half off when the software
 track reaches stage 13; do not quietly redefine it.
 
@@ -51,16 +51,21 @@ formatting change. And **extra fields are allowed**, so the firmware may add one
 What it will reject: a missing field, a non-finite reading, a JSON `true` where
 a number belongs, or a payload that is not a JSON object.
 
-**Stage 8 adds a deadline as well as a shape.** `telemetry.store` carries a 30 s
-`x-message-ttl`, so an MCU message that sits unconsumed for 30 s is
-dead-lettered by the broker with `reason: expired` — nothing wrong with the
-payload, it simply waited. Two consequences for the firmware side:
+**Stage 8 added a deadline as well as a shape, and stage 9 removed it again.**
+`telemetry.store` currently carries **no TTL and no length cap** — just the
+dead-letter exchange — so nothing here bounds how long an MCU message may wait.
+Both experiments are one edit away in `topology_spec.py`, so the consequences
+below still matter whenever either is switched back on.
+
+While the 30 s `x-message-ttl` was live, an MCU message that sat unconsumed for
+30 s was dead-lettered with `reason: expired` — nothing wrong with the payload,
+it simply waited. Two consequences for the firmware side:
 
 - **The MCU sets no Message Expiry Interval**, so its messages always take the
   queue's TTL. That is why MCU messages were the long-lived head during stage
   8's per-message TTL demonstration, and why a `docker compose run` publisher
   can never win the head against a live MCU.
-- **A replayed outage backlog is on the same 30 s clock as anything else.** The
+- **A replayed outage backlog would be on the same clock as anything else.** The
   60 s offline gate can hand the broker up to ~60 readings at once on reconnect;
   if `consumer_store` happens to be down at that moment, that backlog starts
   dead-lettering 30 s later. With a consumer running it drains in well under a

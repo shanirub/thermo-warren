@@ -7,12 +7,15 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 8 done and verified.** Next is stage 9.
+**Software track state: stage 9 done and verified.** Next is stage 10.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
-the payload contract. `telemetry.store` also carries a 30 s `x-message-ttl`, so
-the **broker** dead-letters messages nobody rejected. Shared AMQP plumbing lives
-in `amqp.py`; the payload contract lives in `payload.py`.
+the payload contract. **All three dead-letter triggers are now demonstrated** —
+rejection, expiry and overflow — which completes the arc the plan set out at
+stage 4. `telemetry.store` is back to its baseline of a dead-letter exchange and
+nothing else; stages 8 and 9 each added an argument, measured it, and removed it
+again. Shared AMQP plumbing lives in `amqp.py`; the payload contract lives in
+`payload.py`.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -111,12 +114,14 @@ workarounds would land in the ESP32's credentials at stage 17.
 - **`x-queue-type: classic` stated explicitly on all three**, though it is the
   4.3 default. Documents the classic-vs-quorum decision and immunises against a
   vhost- or policy-level default changing underneath.
-- **`telemetry.store`: `x-dead-letter-exchange` and, from stage 8,
-  `x-message-ttl: 30_000`.** Still no `x-max-length` — that is stage 9's, and
-  stage 9 **clears the TTL** when it lands, so the two never apply at once.
-  Declaring them early with permissive values was considered and rejected — 406
-  fires on *any* argument difference, so it would muddy stages 8 and 9 for no
-  gain. The destructive redeclare is unavoidable.
+- **`telemetry.store`: `x-dead-letter-exchange` and nothing else.** That is the
+  baseline, and stage 9 returned it there. Stages 8 and 9 each added one
+  argument (`x-message-ttl`, then `x-max-length` + `x-overflow`), demonstrated
+  it, and took it out — the plan calls for returning to steady-state settings
+  once the lesson is recorded, and stages 10-13 want data reaching InfluxDB
+  unimpeded. Both sets of constants are still defined in `topology_spec.py`, so
+  either experiment is one edit away; `STORE_ARGS` carries the exact edit in a
+  comment.
 - **`telemetry.observe` has no TTL**, deliberately. It already sheds its head at
   the cap, and a second reason for a message to vanish there would make it
   impossible to say which one acted. The DLQ has none either — its contents are
@@ -521,7 +526,12 @@ deliveries**. A requeue is not a death.
 
 ## Expiry (stage 8, implemented and verified)
 
-`telemetry.store` carries **`x-message-ttl: 30_000`**. The contrast against
+> **Removed again at stage 9**, which returned `telemetry.store` to its
+> baseline. The constant is still in `topology_spec.py` and `STORE_ARGS` carries
+> the one-line edit that re-enables it. Everything below is what was measured
+> while it was live, not current configuration.
+
+`telemetry.store` carried **`x-message-ttl: 30_000`**. The contrast against
 stage 7 is the whole point: those deaths needed a consumer to decide something,
 these happen with **no consumer attached at any point**. Same DLQ, same
 `x-death` shape, `reason: expired` rather than `rejected`.
@@ -637,6 +647,89 @@ whether to shorten the prefetch, bound the write, or raise
 `stop_grace_period`, rather than discovering this when the storage write turns
 out to be slow.
 
+## Overflow (stage 9, implemented and verified)
+
+The third and last death reason. **All three are now observed**: `rejected`
+(stage 7, a consumer decided), `expired` (stage 8, the broker's clock), and
+`maxlen` (stage 9, the queue was full).
+
+Two stage 4 decisions were paid off here. `x-queue-type: classic` exists because
+**`reject-publish-dlx` is classic-only**, and this is the stage that needed it.
+
+### Oldest-out versus newest-out — and who finds out
+
+`--burst 40` into a cap of 20, consumer stopped, run twice:
+
+| `x-overflow` | Survived | Dead-lettered | Publisher told? |
+|---|---|---|---|
+| `drop-head` | **31-40** (newest) | 1-30 (oldest) | **No.** Every PUBACK success |
+| `reject-publish-dlx` | **1-18** (oldest) | 19-40 (newest) | **Yes.** Reason code 151 per message |
+
+**The second column was the expected lesson; the fourth is the better one.** The
+two modes differ not only in which end of the queue is sacrificed but in
+**whether the publisher is told anything at all**. `drop-head` evicts a message
+that was already accepted, so there is nothing to report and the publisher
+carries on believing everything landed. `reject-publish-dlx` refuses the
+incoming publish, so the refusal travels back up the protocol.
+
+That makes the choice a bigger design decision than "which end": one mode is
+silent to the producer and one is not, independently of the data you keep.
+
+### Reason code 151, and a correction to this file
+
+**`publisher._on_publish`'s error branch had never fired.** It was written at
+stage 5 to log any non-zero MQTT 5 reason code at ERROR with the affected `seq`,
+and stage 9 is the first time anything made it run:
+
+```
+ERROR publish not accepted: seq=19 reason_code=151 (Quota exceeded)
+```
+
+**151 is not in the list recorded at stage 5.** That list — `0` success, `16` no
+matching subscribers, `131` implementation specific error — was incomplete.
+`151` (`0x97`, **Quota exceeded**) is what RabbitMQ returns when a queue with a
+`reject-publish*` overflow policy is full. The list has been corrected under
+"Verified broker facts".
+
+This is also the payoff of the stage 5 decision to use MQTT 5 rather than 3.1.1
+"because its PUBACK carries a reason code, which is what makes an unroutable
+publish observable". Four stages later, it observed one.
+
+### Three fates from one burst
+
+`--burst 150` with both consumers stopped, `telemetry.observe` at its cap of 100
+with `drop-head` and **no DLX**, `telemetry.store` at 20 with
+`reject-publish-dlx` and a DLX:
+
+| Queue | Kept | Lost | Evidence |
+|---|---|---|---|
+| `telemetry.observe` | 100 | ~53 | **none anywhere** |
+| `telemetry.store` | 20 | 133 | 133 in the DLQ, and 133 errors at the publisher |
+
+Same messages, same instant, three different outcomes. `telemetry.observe` has
+been silently shedding its head since stage 4 and nothing has ever caught it —
+that is the lossy-by-design policy working, and it is only visible by contrast.
+
+### Why the cap is not in the committed configuration
+
+`STORE_MAX_LENGTH = 20` and both overflow constants are defined but **not** in
+`STORE_ARGS`. The plan says to return both queues to steady-state settings
+afterwards, keeping the dead-letter exchange, and `topology_spec.py` already
+called DLX-only this queue's *baseline*. A cap of 20 is an experiment value, not
+a production one, and stages 10-13 want data reaching InfluxDB unimpeded.
+
+**This was an interpretation, made without consultation**, and it is the stage 9
+decision most worth revisiting: "steady-state settings" could also have meant
+"keep a sensible cap". If so, the fix is one line in `STORE_ARGS`.
+
+Two other stage 9 decisions were also taken unilaterally: **20** for the cap
+(small enough that every surviving `seq` fits on one line, and deliberately not
+`telemetry.observe`'s 100 so the two bounded queues do not read as one
+convention), and **switching overflow mode by editing the constant rather than
+adding a `--overflow` CLI flag** — stage 4 explicitly refused to make topology
+values reachable from outside `topology_spec.py`, and an overflow mode is a
+value where `--recreate` is an operation.
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -666,7 +759,7 @@ out to be slow.
 - **Exit codes:** `0` clean/declared, `2` broker unreachable, `3` auth or
   permissions rejected, `4` argument mismatch or other channel error. SIGTERM and
   SIGINT are handled for a clean disconnect, since compose sends SIGTERM.
-- **Tests must pass with no broker running.** 84/84 at stage 8, across
+- **Tests must pass with no broker running.** 85/85 at stage 9, across
   `test_topology.py`, `test_publisher.py`, `test_consumers.py` and
   `test_payload.py`. The last two are split on purpose: `test_payload.py`
   asserts what `parse()` accepts and rejects, `test_consumers.py` asserts what
@@ -752,8 +845,14 @@ Management UI at `http://localhost:15672`.
 - **A QoS 1 PUBACK is already a publisher confirm.** RabbitMQ withholds it until
   every destination queue has confirmed receipt. No opt-in needed.
 - MQTT 5 PUBACK reason codes from RabbitMQ: `0` success, `16` no matching
-  subscribers (could not route to any queue), `131` implementation specific error
-  (e.g. a target classic queue unavailable).
+  subscribers (could not route to any queue), `131` implementation specific
+  error (e.g. a target classic queue unavailable), and **`151` Quota exceeded**
+  — returned when a destination queue's `reject-publish*` overflow policy
+  refuses the publish. **Observed at stage 9**; the first three were read from
+  documentation at stage 5 and the list was incomplete.
+- **Only a `reject-publish*` overflow tells the publisher anything.**
+  `drop-head` evicts a message that was already accepted, so the PUBACK is a
+  success and the producer never learns it lost data.
 - **MQTT 3.1 / 3.1.1 have no error channel at all** — other than closing the
   connection, the server cannot communicate a publishing error.
 
@@ -952,29 +1051,33 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   explanation (its `service_completed_successfully` gate) remains **inferred,
   not verified**.
 
-## Check first at stage 9
+## Check first at stage 10
 
-**Stage 9 clears the TTL and adds `x-max-length`.** Both are `STORE_ARGS`
-changes, so it is another 406 and another `--recreate` — and remember the plain
-`up -d --wait` will fail with `topology ... exit 4` until you run it.
+**Stage 10 is the first stage in six that adds a container rather than changing
+queue arguments.** No `--recreate`, no 406, no dead-letter behaviour. The broker
+half is finished: all three death reasons are demonstrated and
+`telemetry.store` is back to its baseline.
 
-**The DLQ will then hold three populations**, distinguishable only by
-`x-death.reason`: `rejected` from stage 7, `expired` from stage 8, and `maxlen`
-from stage 9. The `expired` population stops growing the moment the TTL is
-cleared. Purge before counting, or the three mix.
+**The plan's own warnings for stage 10**, worth re-reading before starting:
+capture the InfluxDB admin token into the secrets file **before first startup**
+— from 2.9 onward tokens are hashed on disk and the plaintext cannot be
+recovered — and use a healthcheck that needs no token, or every interval logs an
+authentication failure.
 
-**`--message-expiry` still works after the queue TTL is gone**, and with no
-queue TTL to cap it, a per-message expiry becomes the only deadline — which
-makes the head-of-queue effect easier to demonstrate at longer timescales than
-stage 8 could.
+**Carried open questions that stage 10 touches**: the InfluxDB image tag is
+unverified (RabbitMQ's is settled at `rabbitmq:4.3-management`), and whether
+`curl` or `wget` exists in the Grafana image is unknown, which matters at stage
+12 rather than 10.
 
-**Two publishers are live whenever the MCU is powered.** Only the simulator can
-set `--message-expiry`; MCU messages carry no `expiration`, which is exactly why
-they were the ones sitting at the head during stage 8's demonstration. A
-`docker compose run` publisher takes ~3 s to start, so **the MCU always wins the
-head** — publish from an already-connected process when queue order matters.
+**`.env.example` will need the InfluxDB keys** when `config.py` grows them.
+That file drifted once already, between stages 5 and 6.
 
 ## Open questions
+
+**All stage 6-9 questions are answered.** Stage 9's three were decided without
+consultation and are flagged as such in "Overflow (stage 9)" above — the cap
+value, how the overflow mode is switched, and what "steady state" meant. The
+third is the one worth revisiting.
 
 **All stage 6, 7 and 8 questions are answered.** Stage 8: the TTL value, and
 how to demonstrate the head-of-queue rule.

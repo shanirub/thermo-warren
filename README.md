@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 8 | Both dead-letter triggers verified: rejection (consumer-driven) and expiry (a 30 s TTL the broker enforces with no consumer at all) |
+| Software | 9 | All three dead-letter triggers verified: rejection, expiry and overflow. `telemetry.store` returned to its baseline; the broker half is finished |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -51,7 +51,95 @@ Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
 
+## Stage 9 verification
+
+The third and last dead-letter trigger. **The cap is not in the committed
+configuration** — the plan calls for returning the queues to steady-state
+settings once the lesson is recorded, so `telemetry.store` ends the stage with a
+dead-letter exchange and nothing else. To re-run either experiment, edit
+`STORE_ARGS` in `src/telemetry/topology_spec.py`:
+
+```python
+    "x-dead-letter-exchange": DLX,
+    "x-max-length": STORE_MAX_LENGTH,               # add
+    "x-overflow": STORE_OVERFLOW_OLDEST_OUT,        # or ..._NEWEST_OUT
+```
+
+Then, as at stage 8, the next plain declare exits 4 and you apply it with
+`uv run python -m telemetry.topology --recreate`.
+
+### The Definition of Done
+
+```bash
+docker compose stop consumer-store publisher
+# purge all three queues
+docker compose run --rm publisher python -m telemetry.publisher --burst 40
+docker compose exec rabbitmq rabbitmqctl list_queues name messages_ready
+```
+
+`telemetry.store` holds steady at exactly **20** while `telemetry.dlq` grows.
+The `x-death` reason reads **`maxlen`** — the third distinct value, after
+`rejected` (stage 7) and `expired` (stage 8).
+
+### Which end survives, and who finds out
+
+Run the burst under each overflow mode and read the simulator's `seq` out of
+each queue. Measured here:
+
+| `x-overflow` | Survived | Dead-lettered | Publisher told? |
+|---|---|---|---|
+| `drop-head` | **31-40** (newest) | 1-30 (oldest) | **No.** Every PUBACK success |
+| `reject-publish-dlx` | **1-18** (oldest) | 19-40 (newest) | **Yes.** Reason code 151 |
+
+The second column is the expected lesson. **The fourth is the better one**: the
+two modes differ not only in which end is sacrificed, but in whether the
+producer is told anything at all. `drop-head` evicts a message that was already
+accepted, so there is nothing to report; `reject-publish-dlx` refuses the
+incoming publish, and the refusal travels back up the protocol:
+
+```
+ERROR publish not accepted: seq=19 reason_code=151 (Quota exceeded)
+```
+
+That error branch was written at stage 5 and this is the first time anything
+made it fire.
+
+> **Never use plain `reject-publish`.** It discards without dead-lettering, so
+> the evidence never appears — and the name reads like the safer of the two.
+
+### Three fates from one burst
+
+Stop both consumers, leave `telemetry.observe` at its cap of 100 with
+`drop-head` and no DLX, and `telemetry.store` at 20 with `reject-publish-dlx`:
+
+```bash
+docker compose stop consumer-observe consumer-store
+docker compose run --rm publisher python -m telemetry.publisher --burst 150
+```
+
+| Queue | Kept | Lost | Evidence |
+|---|---|---|---|
+| `telemetry.observe` | 100 | ~53 | **none anywhere** |
+| `telemetry.store` | 20 | 133 | 133 in the DLQ, and 133 errors at the publisher |
+
+`telemetry.observe` has been shedding its head silently since stage 4 and
+nothing has ever caught it. That is the lossy-by-design policy working as
+intended, and it is only visible by contrast.
+
+### Return to steady state
+
+```bash
+# STORE_ARGS back to the dead-letter exchange only
+uv run python -m telemetry.topology --recreate
+docker compose up -d --wait
+```
+
 ## Stage 8 verification
+
+> **Reverted at stage 9**, which returned `telemetry.store` to a dead-letter
+> exchange and nothing else. To follow this section, add
+> `"x-message-ttl": STORE_MESSAGE_TTL_MS` back to `STORE_ARGS` in
+> `src/telemetry/topology_spec.py` first.
 
 `telemetry.store` gains `x-message-ttl: 30000`. That is a queue-argument change,
 so the broker refuses a plain redeclare and **the stack will not come up cleanly
@@ -311,10 +399,12 @@ docker compose exec rabbitmq rabbitmqctl list_queues \
 while `messages_ready` grows -- that is `basic_qos(prefetch_count=10)` bounding
 the window.
 
-> **Changed at stage 8.** `telemetry.store` now carries a 30 s TTL, so the
-> *ready* messages this procedure accumulates start dead-lettering once they
-> age past it. That is the TTL working, not a regression. The unacknowledged 10
-> are unaffected -- a TTL never applies to a delivered message. `telemetry.observe` stays at **0** unacknowledged throughout, which
+> **Briefly changed at stage 8, restored at stage 9.** While the 30 s TTL was
+> live, the *ready* messages this procedure accumulates began dead-lettering
+> once they aged past it. `telemetry.store` carries no TTL again, so this
+> section works as originally written. Worth knowing if you re-enable the stage
+> 8 experiment: the unacknowledged 10 are unaffected either way, because a TTL
+> never applies to a delivered message. `telemetry.observe` stays at **0** unacknowledged throughout, which
 is not a bug: `basic_qos` is ignored on an automatic-acknowledgment channel.
 
 Now kill it uncleanly (`kill -9` the host-mode process, or
