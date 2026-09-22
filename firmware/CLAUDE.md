@@ -28,7 +28,7 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 7, so there are consumers now
+reachable yet** — the software track is at stage 8, so there are consumers now
 but still no InfluxDB and no dashboard. Sign that half off when the software
 track reaches stage 13; do not quietly redefine it.
 
@@ -50,6 +50,22 @@ formatting change. And **extra fields are allowed**, so the firmware may add one
 
 What it will reject: a missing field, a non-finite reading, a JSON `true` where
 a number belongs, or a payload that is not a JSON object.
+
+**Stage 8 adds a deadline as well as a shape.** `telemetry.store` carries a 30 s
+`x-message-ttl`, so an MCU message that sits unconsumed for 30 s is
+dead-lettered by the broker with `reason: expired` — nothing wrong with the
+payload, it simply waited. Two consequences for the firmware side:
+
+- **The MCU sets no Message Expiry Interval**, so its messages always take the
+  queue's TTL. That is why MCU messages were the long-lived head during stage
+  8's per-message TTL demonstration, and why a `docker compose run` publisher
+  can never win the head against a live MCU.
+- **A replayed outage backlog is on the same 30 s clock as anything else.** The
+  60 s offline gate can hand the broker up to ~60 readings at once on reconnect;
+  if `consumer_store` happens to be down at that moment, that backlog starts
+  dead-lettering 30 s later. With a consumer running it drains in well under a
+  second (~10-13 ms per message, measured at stage 17), so this only bites when
+  both halves are down at once — a stage 18 row.
 
 See **`docs/dht-api.md`** for the sensor driver's full API, transcribed from its
 source. Read it instead of guessing or searching — it also records four

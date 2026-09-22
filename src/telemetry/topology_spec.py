@@ -69,6 +69,17 @@ DLQ_BINDING_KEY = "#"
 QUEUE_TYPE = "classic"                 # quorum queues do not support
                                        # reject-publish-dlx, needed at stage 9
 
+STORE_MESSAGE_TTL_MS = 30_000          # 30s. With no consumer the ready count
+                                       # plateaus at roughly publish rate x TTL
+                                       # while the DLQ grows linearly, which
+                                       # makes the result a number you can
+                                       # predict rather than "stuff moved".
+                                       # An order of magnitude above the 2-4s
+                                       # consumer restarts measured at stages
+                                       # 6-7, so a routine restart never
+                                       # dead-letters live data. Stage 9
+                                       # removes it again.
+
 OBSERVE_MAX_LENGTH = 100               # ~100s of publishing at 1 Hz: long
                                        # enough to watch the cap arrive, short
                                        # enough to eyeball which seq survived
@@ -81,13 +92,22 @@ STORE_ARGS: dict[str, object] = {
     # Inert until stage 7 gives the consumer a reason to reject. Attaching it
     # now costs nothing and keeps stages 7-9 pure consumer changes.
     "x-dead-letter-exchange": DLX,
-    # No x-message-ttl (stage 8) and no x-max-length (stage 9), deliberately.
+    # Stage 8. The broker expires these with no consumer involved at all, which
+    # is the whole contrast against stage 7's consumer-driven rejection: same
+    # queue, same DLQ, same x-death header, reason "expired" rather than
+    # "rejected".
+    "x-message-ttl": STORE_MESSAGE_TTL_MS,
+    # No x-max-length (stage 9), deliberately -- and stage 9 clears the TTL
+    # above when it adds one, so the two never apply at once.
 }
 
 OBSERVE_ARGS: dict[str, object] = {
     "x-queue-type": QUEUE_TYPE,
     "x-max-length": OBSERVE_MAX_LENGTH,
     "x-overflow": OBSERVE_OVERFLOW,
+    # No x-message-ttl here, deliberately. This queue already sheds its head at
+    # the cap, and adding a second reason for a message to vanish would make it
+    # impossible to say which one acted.
     # No x-dead-letter-exchange. The absence is the point: dropped messages
     # leave no trace, which is the contrast stages 7 and 9 demonstrate.
 }

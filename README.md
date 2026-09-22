@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 7 | Dead-lettering by rejection verified: bad payloads reach `telemetry.dlq` with an `x-death` header and do not loop. Full payload-contract validation |
+| Software | 8 | Both dead-letter triggers verified: rejection (consumer-driven) and expiry (a 30 s TTL the broker enforces with no consumer at all) |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -50,6 +50,124 @@ docker compose run --rm publisher
 Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
+
+## Stage 8 verification
+
+`telemetry.store` gains `x-message-ttl: 30000`. That is a queue-argument change,
+so the broker refuses a plain redeclare and **the stack will not come up cleanly
+until you run `--recreate`**.
+
+### See the 406 first
+
+This error path was written at stage 4 and this is the first argument mismatch
+that ever triggered it. Worth watching once:
+
+```bash
+uv run python -m telemetry.topology ; echo "exit=$?"
+```
+
+Expect **exit 4** and RabbitMQ's own wording quoted back:
+
+```
+PRECONDITION_FAILED - inequivalent arg 'x-message-ttl' for queue
+'telemetry.store' in vhost '/': received the value '30000' of type
+'signedint' but current is none
+```
+
+`docker compose up -d --wait` fails the same way, with
+`service "topology" didn't complete successfully: exit 4`. That is the stage 4
+gate working, not a broken stack.
+
+```bash
+uv run python -m telemetry.topology --recreate
+```
+
+Both consumers log a broker `Basic.Cancel` and reattach on their own.
+
+### The Definition of Done
+
+Purge `telemetry.dlq` first — `--recreate` deliberately spares it, so stage 7's
+`rejected` deaths would otherwise mix with stage 8's `expired` ones.
+
+```bash
+docker compose stop consumer-store        # leave the publisher running
+docker compose exec rabbitmq rabbitmqctl list_queues \
+    name messages_ready consumers
+```
+
+`telemetry.store` climbs and then **plateaus at roughly publish rate x 30 s**
+while `telemetry.dlq` grows linearly, with `consumers=0` the whole time.
+Measured here with both publishers running (~2/s): store held at **59-61**, DLQ
+grew ~2/s for 108 s. Nothing consumed anything — the broker did this alone.
+
+Then read the header, as at stage 7:
+
+```bash
+# .env is read by Compose, not by your shell, so $RABBITMQ_USER is empty here.
+# Source it in a SUBSHELL -- never into the working shell, or the process
+# environment will outrank .env for every Python module you run afterwards.
+( set -a; . ./.env; set +a
+  curl -su "$RABBITMQ_USER:$RABBITMQ_PASSWORD" \
+    -H 'content-type: application/json' \
+    -d '{"count":1,"ackmode":"ack_requeue_true","encoding":"auto"}' \
+    "http://localhost:$RABBITMQ_MANAGEMENT_PORT/api/queues/%2F/telemetry.dlq/get"
+) | python -m json.tool
+```
+
+`reason: expired`, same queue, same header shape as stage 7 — and the payload is
+a **perfectly valid message**. Nothing was wrong with it; it only waited too
+long. The DLQ now holds two populations you can only tell apart by that field.
+
+### Per-message TTL and the head of the queue
+
+`--message-expiry SECONDS` sets MQTT 5's Message Expiry Interval, which
+RabbitMQ turns into a per-message TTL. Confirm it is really being set before
+drawing conclusions — it shows up as the AMQP `expiration` property:
+
+```bash
+uv run python -m telemetry.publisher --burst 3 --message-expiry 2
+# then GET from telemetry.store: sim-01 rows show expiration=2000,
+# MCU rows show none
+```
+
+**The trap.** With the MCU publishing at 1 Hz and `docker compose run` taking
+~3 s to start a container, MCU messages always reach the queue head first. They
+carry the 30 s queue TTL, so they block the head and your 2-second messages
+linger behind them — which looks *identical* to the expiry property never being
+applied. Publish from an already-connected process when queue order matters.
+
+Measured both ways:
+
+| Setup | Result |
+|---|---|
+| 2 s expiry, at the head | died at **exactly 2.0 s** |
+| 2 s expiry, behind 30 s messages | survived **~30 s**, 15x its own deadline |
+| 60 s expiry, at the head, 30 s queue TTL | died at **30 s** |
+
+The last row is the `min(queue, per-message)` rule: the lower always wins.
+
+And the rule this demonstrates is *not* that the two TTL kinds use different
+machinery. Both expire lazily from the head. A uniform queue-level TTL plus FIFO
+means the head is always both the oldest and the earliest to expire, so
+head-first expiry is always correct. Non-uniform per-message TTLs break that
+correspondence, and only then can a message outlive its deadline.
+
+### Unacknowledged messages are out of reach
+
+```bash
+docker compose stop consumer-store
+uv run python -m telemetry.consumer_store --ack-delay 35   # above the 30s TTL
+```
+
+`messages_unacknowledged` holds at **10** indefinitely — measured at 88 s,
+nearly three TTLs — while ready messages expire into the DLQ around them.
+Delivery takes a message out of the queue's expiry reach, which means a consumer
+holding messages through an outage will not lose them to the TTL. That removes
+one failure mode from stage 11's design space.
+
+```bash
+docker compose start consumer-store publisher
+```
 
 ## Stage 7 verification
 
@@ -95,10 +213,15 @@ same bytes, two fates, because that queue has no dead-letter exchange.
 consumes nothing — `ack_requeue_true` puts the message back.
 
 ```bash
-curl -su "$RABBITMQ_USER:$RABBITMQ_PASSWORD" \
-  -H 'content-type: application/json' \
-  -d '{"count":1,"ackmode":"ack_requeue_true","encoding":"auto"}' \
-  http://localhost:15672/api/queues/%2F/telemetry.dlq/get | python -m json.tool
+# .env is read by Compose, not by your shell, so $RABBITMQ_USER is empty here.
+# Source it in a SUBSHELL -- never into the working shell, or the process
+# environment will outrank .env for every Python module you run afterwards.
+( set -a; . ./.env; set +a
+  curl -su "$RABBITMQ_USER:$RABBITMQ_PASSWORD" \
+    -H 'content-type: application/json' \
+    -d '{"count":1,"ackmode":"ack_requeue_true","encoding":"auto"}' \
+    "http://localhost:$RABBITMQ_MANAGEMENT_PORT/api/queues/%2F/telemetry.dlq/get"
+) | python -m json.tool
 ```
 
 Expect `reason: rejected`, `queue: telemetry.store`, `count: 1`, and
@@ -186,7 +309,12 @@ docker compose exec rabbitmq rabbitmqctl list_queues \
 
 `telemetry.store` should climb to **exactly 10** unacknowledged and hold there
 while `messages_ready` grows -- that is `basic_qos(prefetch_count=10)` bounding
-the window. `telemetry.observe` stays at **0** unacknowledged throughout, which
+the window.
+
+> **Changed at stage 8.** `telemetry.store` now carries a 30 s TTL, so the
+> *ready* messages this procedure accumulates start dead-lettering once they
+> age past it. That is the TTL working, not a regression. The unacknowledged 10
+> are unaffected -- a TTL never applies to a delivered message. `telemetry.observe` stays at **0** unacknowledged throughout, which
 is not a bug: `basic_qos` is ignored on an automatic-acknowledgment channel.
 
 Now kill it uncleanly (`kill -9` the host-mode process, or
