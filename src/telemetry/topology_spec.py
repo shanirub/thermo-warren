@@ -69,6 +69,13 @@ DLQ_BINDING_KEY = "#"
 QUEUE_TYPE = "classic"                 # quorum queues do not support
                                        # reject-publish-dlx, needed at stage 9
 
+# --- Stage 8's and stage 9's experiments -----------------------------------
+#
+# Both are DEFINED but NOT in STORE_ARGS below: stage 9 returned telemetry.store
+# to its baseline of "dead-letter exchange and nothing else". They are kept
+# here, with their measured behaviour, so either experiment is one edit away --
+# see the comment block in STORE_ARGS.
+
 STORE_MESSAGE_TTL_MS = 30_000          # 30s. With no consumer the ready count
                                        # plateaus at roughly publish rate x TTL
                                        # while the DLQ grows linearly, which
@@ -77,8 +84,31 @@ STORE_MESSAGE_TTL_MS = 30_000          # 30s. With no consumer the ready count
                                        # An order of magnitude above the 2-4s
                                        # consumer restarts measured at stages
                                        # 6-7, so a routine restart never
-                                       # dead-letters live data. Stage 9
-                                       # removes it again.
+                                       # dead-letters live data. Measured at
+                                       # stage 8: ready plateaued at 59-61 with
+                                       # both publishers running (~2/s x 30s)
+                                       # while the DLQ grew linearly.
+
+STORE_MAX_LENGTH = 20                  # Stage 9. Small on purpose: every
+                                       # surviving seq fits on one line, which
+                                       # is what makes the oldest-out vs
+                                       # newest-out contrast readable, and
+                                       # `--burst 40` is exactly twice the cap.
+                                       # Deliberately NOT 100 like the
+                                       # observation queue -- two bounded queues
+                                       # running one number would look like a
+                                       # convention rather than two policies.
+
+# The stage 9 comparison. At the cap a bounded queue must sacrifice one end or
+# the other, and which end is a real design decision in any bounded system.
+STORE_OVERFLOW_OLDEST_OUT = "drop-head"            # dead-letters the OLDEST
+STORE_OVERFLOW_NEWEST_OUT = "reject-publish-dlx"   # dead-letters the NEWEST
+#
+# NEVER plain "reject-publish" here: it discards the message WITHOUT
+# dead-lettering, so the evidence this whole project is built to read simply
+# does not appear. The trap is that the name looks like the safer of the two.
+#
+# reject-publish-dlx is classic-queue only, which is why QUEUE_TYPE is classic.
 
 OBSERVE_MAX_LENGTH = 100               # ~100s of publishing at 1 Hz: long
                                        # enough to watch the cap arrive, short
@@ -89,16 +119,25 @@ OBSERVE_OVERFLOW = "drop-head"         # evict oldest; explicit because plain
 
 STORE_ARGS: dict[str, object] = {
     "x-queue-type": QUEUE_TYPE,
-    # Inert until stage 7 gives the consumer a reason to reject. Attaching it
-    # now costs nothing and keeps stages 7-9 pure consumer changes.
+    # The one permanent argument. Stage 7 gave the consumer a reason to reject
+    # into it, stages 8 and 9 gave the broker two more, and it outlives all of
+    # them.
     "x-dead-letter-exchange": DLX,
-    # Stage 8. The broker expires these with no consumer involved at all, which
-    # is the whole contrast against stage 7's consumer-driven rejection: same
-    # queue, same DLQ, same x-death header, reason "expired" rather than
-    # "rejected".
-    "x-message-ttl": STORE_MESSAGE_TTL_MS,
-    # No x-max-length (stage 9), deliberately -- and stage 9 clears the TTL
-    # above when it adds one, so the two never apply at once.
+    #
+    # BASELINE: dead-letter exchange and nothing else. Stages 8 and 9 each added
+    # an argument here, demonstrated it, and took it out again -- the plan calls
+    # for returning to steady-state settings once the lesson is recorded, and
+    # stages 10-13 want data reaching InfluxDB unimpeded.
+    #
+    # To re-run stage 8's expiry experiment, add:
+    #     "x-message-ttl": STORE_MESSAGE_TTL_MS,
+    #
+    # To re-run stage 9's overflow experiment, add BOTH:
+    #     "x-max-length": STORE_MAX_LENGTH,
+    #     "x-overflow": STORE_OVERFLOW_NEWEST_OUT,   # or ..._NEWEST_OUT
+    #
+    # Either way it is a queue-argument change, so the next plain declare exits
+    # 4 and you need `python -m telemetry.topology --recreate`.
 }
 
 OBSERVE_ARGS: dict[str, object] = {
