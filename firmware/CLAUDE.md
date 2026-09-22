@@ -28,8 +28,9 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 9, so there are consumers now
-but still no InfluxDB and no dashboard. Sign that half off when the software
+reachable yet** — the software track is at stage 10, so there are consumers and
+an InfluxDB now, but nothing writes to it (stage 11) and there is no Grafana
+(stage 12) and no dashboard (stage 13). Sign that half off when the software
 track reaches stage 13; do not quietly redefine it.
 
 Stage 6 confirmed one half of the contract end to end: the MCU's messages are

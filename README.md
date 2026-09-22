@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 9 | All three dead-letter triggers verified: rejection, expiry and overflow. `telemetry.store` returned to its baseline; the broker half is finished |
+| Software | 10 | InfluxDB up and provisioned at first start — org, bucket and admin token. Nothing writes to it yet; that is stage 11 |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -24,10 +24,19 @@ the tracks stop being independent.
 ## Setup
 
 ```bash
-cp .env.example .env      # then edit the password
+cp .env.example .env      # then edit the passwords
+openssl rand -hex 32      # paste into INFLUXDB_TOKEN in .env
 uv lock                   # pyproject changed at stage 5 (paho-mqtt)
 uv sync                   # creates .venv/ and installs the project editable
 ```
+
+**Generate `INFLUXDB_TOKEN` before the first `docker compose up`.** From
+InfluxDB 2.9 the token is hashed on disk and the plaintext cannot be recovered,
+so a token InfluxDB invents for itself is one nothing else can ever use. Hex
+rather than base64 keeps `/`, `+` and `=` out of a value that gets pasted into
+`.env` and into curl commands. The same applies to `INFLUXDB_USERNAME` and
+`INFLUXDB_PASSWORD`: like the broker's credentials, they are applied only on
+first boot against an empty volume.
 
 ## Run modes
 
@@ -50,6 +59,89 @@ docker compose run --rm publisher
 Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
+
+## Stage 10 verification
+
+Storage. The first stage in six that adds a container rather than changing queue
+arguments — no `--recreate`, no 406, no dead-lettering. Nothing writes to
+InfluxDB yet; `consumer_store` gains that at stage 11.
+
+### The Definition of Done
+
+```bash
+docker compose up -d --wait     # exit 0; influxdb reports healthy
+docker compose ps               # influxdb  Up (healthy)
+
+# The bucket exists -- and note there is no --token here. The entrypoint wrote
+# the CLI's host and admin token into /etc/influxdb2, which is a named volume
+# for exactly this reason. If this ever asks for a token, that volume is what
+# to check.
+docker compose exec influxdb influx bucket list
+```
+
+Expect `telemetry` with retention printed as `infinite`, alongside the
+`_monitoring` and `_tasks` buckets InfluxDB creates for itself.
+
+### Write one point by hand and read it back
+
+```bash
+docker compose exec influxdb influx write \
+  --bucket telemetry --precision s 'stage10_check,src=hand value=1'
+
+docker compose exec influxdb influx query \
+  'from(bucket:"telemetry") |> range(start:-1h)
+     |> filter(fn:(r) => r._measurement == "stage10_check")'
+```
+
+Two things about that snippet are deliberate.
+
+**The measurement is `stage10_check`, not the telemetry measurement stage 11
+will choose.** Retention is infinite, so this point is permanent; a throwaway
+name keeps it from ever being mistaken for real data. `influx delete
+--predicate` removes it if you want it gone.
+
+**The read-back is Flux, not InfluxQL**, even though the project chose InfluxQL.
+InfluxQL needs a DBRP mapping exposing the bucket under a v1-style database
+name, and the plan puts that at stage 12. This is staging, not drift.
+
+### Provisioning, not a stale volume
+
+```bash
+docker compose down             # NO -v
+docker compose up -d --wait
+docker compose logs influxdb | grep -i "skipping setup wrapper"
+docker compose logs influxdb | grep -icE "user-provided scripts|initialization complete"
+```
+
+The bucket and the hand-written point must both still be there.
+
+**The trap:** `found existing boltdb file, skipping setup wrapper` appears on a
+genuine first boot too, so it is not the marker it looks like. The entrypoint
+ends with `exec setpriv --reuid=influxdb ... "$BASH_SOURCE"` to drop from root,
+and that re-exec re-enters `main()` after setup has already created the bolt
+file. Count the setup markers instead:
+
+| | `skipping setup wrapper` | `initialization complete` |
+| --- | --- | --- |
+| First boot | 1 | present |
+| Every later start | 2 | absent |
+
+### Why the healthcheck hits `/health`
+
+```bash
+docker compose logs influxdb | grep -ic "unauthorized\|401"     # expect 0
+```
+
+The plan warns that a healthcheck needing a token logs an authentication failure
+every interval forever. `/health` needs none, and returns 200 healthy / 503
+unhealthy so `curl -f` maps straight onto it. `/ready` has no failure status
+code in the OSS API spec and cannot express "not ready" at all.
+
+Unlike the broker's check, this one is *readiness*: `curl` proves the HTTP API
+answers, not merely that a socket accepts. Stage 11 gates `consumer-store` on it.
+The `start_period` covers a two-phase startup rather than a slow boot — on first
+start the entrypoint runs a temporary `influxd` on port 9999, sets up against
+it, kills it, and only then binds 8086.
 
 ## Stage 9 verification
 
