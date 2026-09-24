@@ -1660,7 +1660,7 @@ depths climb **in lockstep**. **That is wrong.** `telemetry.observe` carries
 `telemetry.store` grows unbounded. A burst does not add the same count to both.
 
 This is stage 9's lesson arriving early, not a bug. Treat the plan's wording as
-superseded; the README explains the cap.
+superseded; the stage 5 section of `docs/verification-log.md` explains the cap.
 
 Stage 6's DoD says both consumers "report the same sequence numbers". True, but
 **only over the interior of a run, and only while `consumer_observe` keeps up**.

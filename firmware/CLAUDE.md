@@ -93,6 +93,11 @@ timeline (which is what refutes "the gate is below the expiry, so the expiry
 never fires"), and task ownership (which code runs on which task, and why the
 `msg_id`->`seq` map needs a mutex).
 
+**`docs/stage17-sensor-node.jpg`** is the assembled node: board, DHT11, OLED and
+the breadboard wiring, with the display showing a live reading and the link icon.
+It is the photo at the top of the root `README.md`, and it sits here rather than
+next to the software half's dashboard image because it is hardware.
+
 ## Toolchain
 
 - **ESP-IDF v5.5.5** at `~/esp/esp-idf-v5.5.5`, target **esp32c3**

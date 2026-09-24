@@ -50,13 +50,15 @@ of stages not yet planned.**
 | Path | Contents |
 |---|---|
 | `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP and storage plumbing, config — see `src/telemetry/CLAUDE.md` |
-| `firmware/` | ESP-IDF project for the ESP32-C3 — see `firmware/CLAUDE.md` |
+| `firmware/` | ESP-IDF project for the ESP32-C3, with `docs/` for the driver API, diagrams and a photo of the assembled node — see `firmware/CLAUDE.md` |
 | `tests/` | pytest, **no broker and no database required** — keep it that way |
 | `rabbitmq/` | broker config and enabled plugins; an unknown key aborts startup |
 | `grafana/provisioning/` | datasource (stage 12) and dashboard (stage 13), read-mounted; Grafana keeps no state of its own |
 | `influxdb/dbrp.sh` | one-shot declarer for the InfluxQL database mapping |
 | `compose.yaml` | RabbitMQ, InfluxDB, Grafana, publisher, consumers, two one-shot declarers |
 | `mcu-rabbitmq-staged-plan.md` | The 18-stage plan, with per-stage Definitions of Done |
+| `docs/verification-log.md` | How every stage was checked, newest first — the commands, moved out of `README.md` at stage 13 |
+| `src/telemetry/docs/` | The stage 13 dashboard image |
 
 ## These CLAUDE.md files are the decision record
 
@@ -71,6 +73,19 @@ environment. A decision that exists only in a chat transcript is lost.
 
 Keep entries compact and written as current-state reference, not as narrative.
 "Why" matters; "what we tried third" usually does not.
+
+**Three documents, three jobs**, settled at stage 13 when the README's
+verification sections were moved to `docs/verification-log.md`:
+
+| Document | Holds |
+|---|---|
+| `mcu-rabbitmq-staged-plan.md` | each stage's Definition of Done — what "done" means before the work starts |
+| `CLAUDE.md`, one per directory | what was verified, what it proved, what was decided. **The decision record** |
+| `docs/verification-log.md` | how to re-run it: the commands, newest stage first |
+
+The split is what stops any one of them growing without bound. The README had
+become an append-only log ten times the length of the page it was appended to;
+the verification log is allowed to grow that way, because that is all it is.
 
 **Settled decisions stay settled.** Anything recorded here is not to be
 re-opened, re-litigated or re-searched. If something looks wrong, say so and
