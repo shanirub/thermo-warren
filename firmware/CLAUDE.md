@@ -7,7 +7,8 @@ stages 14 → 15 → 16 → 17. Nothing is thrown away between them.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Hardware track state: stage 17 publishing verified on hardware.**
+**Hardware track state: stage 17 done, both halves of its DoD signed off.**
+The hardware track is finished; stage 18 needs both halves at once.
 
 Verified: MQTT 5 over TCP to RabbitMQ, SNTP, 1 Hz publish of the cached DHT11
 reading at QoS 1, both queues filling from the MCU with the simulator stopped,
@@ -27,14 +28,16 @@ change). Confirming it means one outage longer than 120 s showing **no**
 `outbox expiry dropped` lines at all — that is what produced 29 of them under the
 old 120 s fuse, so its absence is the test.
 
-Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet**, but only one thing is now missing. The software track is at
-stage 12, so **this board's readings are stored in InfluxDB and reachable from
-Grafana** — `esp32c3-01` is a live series alongside `sim-01` with its own
-independent `seq`, and a stage 12 query through Grafana's datasource counted
-12848 of its points against the simulator's 13187 over 24 h. What is still
-missing is the dashboard itself (stage 13). Sign that half off when the software
-track reaches stage 13; do not quietly redefine it.
+**Stage 17's DoD is now complete in both halves.** The second half — "the
+dashboard shows real room temperature" — was signed off when the software track
+reached stage 13: `esp32c3-01` renders as its own series on both panels of the
+`telemetry-live` dashboard, alongside `sim-01`, at ~890 points per 15-minute
+window. **No firmware change was needed for it**, and none was made; the panels
+group by the `device` tag, which is the only tag there is.
+
+The path underneath was already proven at stage 12: a query through Grafana's
+datasource counted 12848 of this board's points against the simulator's 13187
+over 24 h.
 
 **Nothing in the firmware had to change for the storage write to work.** The
 payload contract held exactly as frozen at stage 5, which is what building the

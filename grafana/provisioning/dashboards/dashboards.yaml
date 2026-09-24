@@ -1,0 +1,60 @@
+# Stage 13. The file provider: it tells Grafana to load every *.json in this
+# directory as a dashboard, on start and then on a timer. The same argument as
+# stage 12's datasource file -- configuration in version control, not clicked in
+# -- and the same enforcement behind it: the `grafana` service has NO state
+# volume, so /var/lib/grafana/grafana.db starts empty on every `up` and a
+# dashboard that is present afterwards can only have come from a file.
+#
+# Grafana reads only *.json from `options.path`, so this provider file sitting in
+# the directory it provisions is not mistaken for a dashboard.
+
+apiVersion: 1
+
+providers:
+  # Names the provider, not the dashboard. It appears in Grafana's provisioning
+  # log lines and is what `disableDeletion` below is scoped to.
+  - name: telemetry
+
+    # Explicit although 1 is the only organisation this Grafana has: the default
+    # org id is stated rather than inherited.
+    orgId: 1
+
+    # Empty means the top-level Dashboards list. One dashboard does not need a
+    # folder, and a folder name here would be a second place the dashboard's
+    # address is written down -- the uid inside the JSON is the address.
+    folder: ""
+
+    type: file
+
+    # false: deleting telemetry.json removes the dashboard from Grafana too, on
+    # the next scan. Explicit although it is the default, because the opposite
+    # would let a dashboard outlive the file that defines it -- exactly the
+    # divergence between repository and running system this stage exists to
+    # rule out. (With no state volume it could not survive a `down` either way;
+    # this makes it true for a running container as well.)
+    disableDeletion: false
+
+    # Seconds between rescans of the path. Explicit at Grafana's own default:
+    # editing telemetry.json shows up within ~10s with no restart, which is what
+    # makes iterating on a panel bearable when the file is the only way to edit
+    # it.
+    updateIntervalSeconds: 10
+
+    # false: the UI cannot save changes back over the provisioned dashboard.
+    # Explicit although it is the default. Panel edits made in the browser are
+    # scratch -- they do not persist, and with no state volume they would not
+    # survive a `down` regardless. The file is the only way to change this
+    # dashboard, which is the point of the stage.
+    allowUiUpdates: false
+
+    options:
+      # The container path, not the host one. `./grafana/provisioning` is bind
+      # mounted read-only at /etc/grafana/provisioning by compose, and
+      # GF_PATHS_PROVISIONING states that same root explicitly on the service.
+      path: /etc/grafana/provisioning/dashboards
+
+      # false: subdirectories would become Grafana folders. There is one
+      # dashboard and no subdirectories, so this only decides what a future one
+      # would do, and it should be a deliberate choice then rather than a
+      # surprise inherited now.
+      foldersFromFilesStructure: false

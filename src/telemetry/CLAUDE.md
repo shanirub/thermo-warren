@@ -7,7 +7,9 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 12 done and verified.** Next is stage 13.
+**Software track state: stage 13 done and verified. The software track is
+finished.** Stages 1-13 are all closed; the next stage on any track is 18,
+end-to-end resilience, and it needs both halves at once.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
 the payload contract. **All three dead-letter triggers are now demonstrated** —
@@ -23,7 +25,9 @@ the pipeline is at-least-once end to end. Storage plumbing lives in
 
 **Grafana reads it back from stage 12**, with its datasource provisioned from
 `grafana/provisioning/` and the InfluxQL database declared by a one-shot `dbrp`
-service. **No Python was involved**, and none should be at stage 13 either.
+service. **Stage 13 added the dashboard** from the same directory: two panels,
+one series per device, 15 minutes at a 5 s refresh. **No Python was involved in
+either stage**, and neither needed a rebuild or a `compose.yaml` change.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -109,13 +113,30 @@ which is meaningless for a consumer.
   queue argument and a field name fail in three different ways. `payload.py`
   joined the list at stage 7.
 
-**Stage 12's two files hold no Python and do not join that list.** The database
-name is not a literal in either of them — `influxdb/dbrp.sh` and the datasource
-file both take it from `${INFLUXDB_BUCKET}`, so bucket and database cannot drift
-apart. What *is* literal there is the retention policy `autogen` and the
-datasource uid `influxdb-telemetry`, and both are deliberate: `autogen` matches
-the name InfluxDB gives the virtual mapping it replaces, and the uid is pinned
-because stage 13's dashboard references it.
+**The four non-Python files from stages 12 and 13 do not join that list.** The
+database name is not a literal in the stage 12 pair — `influxdb/dbrp.sh` and the
+datasource file both take it from `${INFLUXDB_BUCKET}`, so bucket and database
+cannot drift apart. What *is* literal there is the retention policy `autogen` and
+the datasource uid `influxdb-telemetry`, and both are deliberate: `autogen`
+matches the name InfluxDB gives the virtual mapping it replaces, and the uid is
+pinned because stage 13's dashboard references it.
+
+**Stage 13's dashboard restates three things Python already owns**, and they are
+the known cost of a dashboard being data rather than code:
+
+- the datasource uid, four times — once on each panel and once on each target;
+- the measurement `readings` and the field names `temp_c` / `humidity_pct`,
+  which `storage.py` owns and derives from `payload.py`;
+- the `device` tag name, same source.
+
+**`$VAR` substitution does not reach a dashboard JSON** — verified, not assumed:
+a panel titled `Humidity $INFLUXDB_BUCKET` was read back from the API with the
+`$INFLUXDB_BUCKET` still literal, although the same variable is substituted in
+the datasource YAML two directories away. So this duplication has no mechanism
+available to remove it. **The failure mode is quiet**: rename a field in
+`payload.py` and the pipeline keeps working while a panel goes empty, with no
+error anywhere. `storage.describe()` in the consumer's startup log is what a
+panel should be checked against.
 
 ## Topology
 
@@ -1181,6 +1202,188 @@ probe. Conservative, not wrong — but poll the endpoint, don't race it.
 | Explicit mapping exists | `influx v1 dbrp list` → one row, `VIRTUAL` section now empty |
 | Tests with nothing changed | **114/114** |
 
+## Dashboard (stage 13, implemented and verified)
+
+Two panels reading what `consumer_store` wrote. **No Python, no new dependency,
+no rebuild, and no change to `compose.yaml`** — the `./grafana/provisioning`
+bind mount from stage 12 already covers a new `dashboards/` subdirectory.
+
+| Thing | Value |
+|---|---|
+| Dashboard uid | `telemetry-live` — pinned, for the same reason the datasource's is |
+| Title | `Live telemetry` |
+| Time range / refresh | `now-15m` / `5s` |
+| Screenshot | `src/telemetry/docs/stage13-dashboard.png` — how it was taken is below |
+| Panels | `Temperature` (unit `celsius`) and `Humidity` (unit `humidity`), side by side, 12 columns each |
+| Provider name | `telemetry` |
+| Files | `grafana/provisioning/dashboards/dashboards.yaml`, `grafana/provisioning/dashboards/telemetry.json` |
+
+### Hand-written JSON, not a UI export
+
+An export carries `__inputs` / `${DS_INFLUXDB}` placeholders, which the UI's
+import dialog resolves and a file provider has no dialog to run — and nothing
+substitutes a variable into a dashboard JSON at provisioning time, which was
+verified separately below. Plus a pile of editor state. Every panel and every
+target names `{"type": "influxdb", "uid": "influxdb-telemetry"}` directly
+instead — which is what the uid was pinned at stage 12 for.
+
+`"id": null` and `"schemaVersion": 42`. **42 is `DASHBOARD_SCHEMA_VERSION` in
+13.2.2**, read out of `public/app/features/dashboard/state/DashboardMigrator.ts`
+in the running container rather than guessed; a lower number would silently be
+migrated forward on load.
+
+JSON has no comments, so the reasoning lives in the dashboard's and each panel's
+`description` field, where Grafana also shows it in the UI. The provider file is
+YAML and carries its comments normally.
+
+### Raw points, no `GROUP BY time()`
+
+```sql
+SELECT "temp_c" FROM "readings" WHERE $timeFilter GROUP BY "device"
+```
+
+`"rawQuery": true`, so the JSON states the InfluxQL it runs instead of encoding
+it as the query builder's structured model. No `mean()`, no `fill()`, no time
+bucketing: at 1 Hz over 15 minutes the panel plots the points the pipeline
+actually stored. Bucketing would average a duplicate away and interpolate across
+a gap — the two things stages 9 and 18 exist to make visible. ~890 points per
+series per panel, measured through the API; panel rendering at that density was
+not timed.
+
+### `GROUP BY "device"`, and no template variable
+
+One series per publisher, `sim-01` and `esp32c3-01` together in one panel. A
+`WHERE device = 'sim-01'` filter would hide the hardware the project spent four
+stages on.
+
+**A template variable was rejected**: `SHOW TAG VALUES FROM readings WITH KEY =
+device` lists five devices, three of them the permanent stage 11 artefacts
+(`burst-probe`, `int-probe`, `overwrite-probe`). A short time range excludes them
+for free — they have no recent points — so the dashboard needs no filtering
+logic at all. **Verified**: the 15-minute query returns exactly two frames.
+
+**`"alias": "$tag_device"`** on each target, so the legend reads `sim-01` rather
+than `readings.temp_c {device: sim-01}`. Verified through `POST /api/ds/query`:
+the frames come back named `sim-01` and `esp32c3-01`, with `labels` intact.
+
+### 5 s refresh, because 5 s is the floor
+
+**`min_refresh_interval = 5s` in Grafana's `defaults.ini`** — read out of the
+running 13.2.2 image, not remembered. A dashboard asking for less does not get
+it; what Grafana does with the request (clamp, or drop the refresh) was **not
+tested**, because this dashboard asks for exactly the floor. Riding the floor
+keeps stage 13 a pure provisioning stage: no
+`GF_DASHBOARDS_MIN_REFRESH_INTERVAL` override, and `compose.yaml` is untouched.
+Going faster is one explicit environment line on the `grafana` service if a later
+stage ever wants it.
+
+### `insertNulls`, so an outage is a break and not a straight line
+
+`custom.insertNulls: 3000` on both panels. **Verified present in 13.2.2**:
+`public/app/plugins/panel/timeseries/config.ts` defines path `insertNulls`
+("Disconnect values"), default `false`, applied only when `drawStyle` is `line`,
+taking a millisecond threshold. 3000 is three times the 1 Hz publish interval of
+*both* publishers (the ESP32's loop is 1 s plus execution time, so it drifts),
+which is wide enough that normal jitter cannot draw a false break.
+
+**Observed working**, in the screenshot below. The `docker compose down` / `up`
+of the teardown check left `sim-01` a **10210 ms** gap at 21:35:44, measured in
+the query response, and the rendered trace breaks there instead of drawing a line
+across — while the 1001 ms normal interval either side stays connected. A
+`docker compose restart publisher` does **not** produce a break: it costs about a
+second, under the threshold, which is the behaviour wanted.
+
+### `allowUiUpdates: false` is enforced — but `meta.canSave` does not say so
+
+`GET /api/dashboards/uid/telemetry-live` reports `"provisioned": true`,
+`"provisionedExternalId": "telemetry.json"` — **and `"canSave": true`,
+`"canEdit": true`**, which is about permissions and is not the provisioning
+guard. The guard is real and was tested rather than assumed: a `POST
+/api/dashboards/db` with a changed title returns **HTTP 400 `{"message":"Cannot
+save provisioned dashboard"}`** and the title is unchanged afterwards.
+
+`"editable": false` in the JSON is the matching statement on the dashboard side.
+Flipping it to `true` is the one-line way to allow scratch edits in the browser
+during a stage 18 investigation — they still cannot be saved, and they die at the
+next `down` regardless.
+
+### `$VAR` substitution stops at the YAML
+
+Stage 12's datasource file resolves `$INFLUXDB_BUCKET` and `$INFLUXDB_TOKEN` out
+of Grafana's environment. **That does not extend to a dashboard JSON.** Verified:
+a panel titled `Humidity $INFLUXDB_BUCKET` came back from the API with the text
+still literal. The measurement, field and tag names in the panel queries are
+therefore duplicated from `storage.py` with nothing available to remove the
+duplication — see "Where things live" for what that costs.
+
+### `updateIntervalSeconds: 10` — a rescan, not a restart
+
+Verified: editing the title in `telemetry.json` reached the API within the
+interval with no `docker compose restart grafana`. The provider *config* file is
+read at startup only; the dashboard JSON is rescanned on the timer. So a panel
+can be iterated on by editing the file, which matters because the file is the
+only way to edit it.
+
+### The teardown proves provisioning, and did so by deleting something
+
+`docker compose down` (no `-v`) then `up -d`. Before the teardown, Grafana also
+held a `New dashboard` someone had created in the UI. Afterwards **only
+`telemetry-live` was listed** — the clicked-in one was gone with the container's
+writable layer, and the provisioned one was back. That is the stage 12 argument
+for having no state volume, demonstrated rather than restated.
+
+### Provisioning log noise, pre-existing
+
+Every Grafana start logs two `level=error` lines:
+
+```
+Failed to read plugin provisioning files from directory  path=/etc/grafana/provisioning/plugins
+can't read alerting provisioning files from directory    path=/etc/grafana/provisioning/alerting
+```
+
+The read-only bind mount replaces the **whole** `/etc/grafana/provisioning`
+directory, so only the subdirectories that exist in the repo exist in the
+container. Present since stage 12 and harmless; provisioning of what is there
+succeeds in the same second. Creating empty `plugins/` and `alerting/`
+directories to silence it would add two directories that declare nothing.
+
+### Screenshotting the dashboard without the renderer plugin
+
+Most of the verification below goes through Grafana's HTTP API — the same queries
+the panels issue, through the same datasource proxy — but an API cannot show that
+a panel *draws*. Grafana renders server-side only with the image renderer plugin,
+which is not installed and was not installed for this.
+
+`docs/stage13-dashboard.png` was captured with the host's own headless Chrome
+instead. **Two things make this harder than it looks, both learned the hard way:**
+
+- **Credentials in the URL do not work.** `http://user:pass@localhost:3000/d/...`
+  lands on the login page: Chrome drops embedded credentials, and Grafana's
+  frontend wants a session rather than basic auth regardless.
+- **So the session cookie has to be injected**, which `--screenshot` alone cannot
+  do. `POST /login` with a JSON body returns a `grafana_session` cookie; Chrome is
+  then launched with `--remote-debugging-port`, and over the DevTools protocol:
+  `Network.setCookie`, `Page.navigate`, wait, `Page.captureScreenshot`.
+
+Two other details worth keeping: `?kiosk` on the URL drops the nav chrome, and
+the wait before capturing must be generous (~14 s used) because the panels draw
+well after the load event — there is no load event to race.
+
+### Stage 13 DoD — verified against real behaviour
+
+| Check | Result |
+|---|---|
+| Dashboard present without anyone opening the UI | `GET /api/search?type=dash-db` → `telemetry-live`; `provisioned: true`, `provisionedExternalId: telemetry.json` |
+| Both panels render live data | `POST /api/ds/query`, both panel queries → **two frames each**, ~890 points per series over 15 min, named `sim-01` / `esp32c3-01`; and drawn, in `docs/stage13-dashboard.png` — two panels, two series each, legend by device, °C and %H |
+| `insertNulls: 3000` draws a break | The teardown's 10210 ms gap in `sim-01` renders as a **disconnect**, the 1001 ms normal interval does not |
+| Artefact devices absent | Two frames, not five — the short range excludes them with no filter |
+| **Publisher range changed** | `TEMP_MIN_C, TEMP_MAX_C = 40, 50`, `restart publisher` → `sim-01` stepped ~33 → 40 on the first tick, well inside one 5 s refresh; reverted → back to ~23 |
+| Provisioned dashboard cannot be saved | `POST /api/dashboards/db` → **HTTP 400**, "Cannot save provisioned dashboard", title unchanged |
+| File edit picked up without a restart | Title change visible via the API inside `updateIntervalSeconds: 10` |
+| Teardown, **no `-v`**, then up | `telemetry-live` back from the file; a UI-created dashboard **gone**; three volumes, none Grafana's |
+| Steady state unchanged | three healthy, three up, `topology` and `dbrp` both `Exited (0)` |
+| Tests with nothing changed | **114/114**, no broker and no InfluxDB |
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -1593,33 +1796,68 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   in the series index until compaction, so `schema.tagValues` keeps listing a
   deleted device. Query for actual points to confirm a deletion, not the tag list.
 
-## Check first at stage 13
+## Check first at stage 18
 
-**Stage 13 is a provisioning stage too**, and like stage 12 it should need no
-Python: temperature and humidity panels on a short time range with a fast
-refresh, provisioned as a dashboard file under `grafana/provisioning/dashboards/`
-rather than saved from the UI. Grafana has no state volume, so a dashboard built
-by clicking would be lost on the next `down`.
+**Stage 18 is the first stage that needs both halves**, and it is the first one
+on this track that is not a build stage at all: nothing new is written, the
+existing pipeline is broken deliberately and watched. What to have in hand before
+starting:
 
-- **The measurement is `readings` and the only tag is `device`.** A panel is
-  `SELECT temp_c FROM readings WHERE device = 'sim-01'`, against database
-  `telemetry`, which is the DBRP database and *not* the measurement.
-- **Reference the datasource by uid `influxdb-telemetry`.** It is pinned for
-  exactly this, and a provisioned datasource is `readOnly` — the dashboard
-  points at it, it is not adjusted by hand.
-- **Two devices are publishing.** `sim-01` and `esp32c3-01` carry independent
-  `seq` counters starting at 1. Any panel that does not group or filter by
-  `device` interleaves them.
-- **The `device` tag index also holds three stage 11 test values** —
-  `burst-probe`, `int-probe` and `overwrite-probe` — with no recent points. A
-  template variable built from `SHOW TAG VALUES FROM readings WITH KEY = device`
-  will list five devices, three of them artefacts. Either filter them or accept
-  them knowingly; they are permanent, because retention is infinite.
-- **`docker compose build` is only needed when `pyproject.toml` changes.** Stage
-  12 added two containers and needed none — but `up -d <service>` silently reuses
-  an old image, so check if anything Python does change.
+- **The dashboard is the instrument.** `http://localhost:3000/d/telemetry-live`,
+  15 minutes at 5 s. `custom.insertNulls: 3000` draws a gap wider than 3 s as a
+  break rather than a line across — **verified at stage 13** against a 10.2 s hole
+  left by a `down`/`up`. So a break on a panel is a real outage rather than a
+  rendering artefact, and the absence of one is meaningful too. Screenshotting it
+  without the renderer plugin is a two-step dance with a session cookie — the
+  recipe is in the stage 13 section.
+- **`seq` is a field, so it is selectable.** `SELECT count("seq") FROM readings
+  WHERE $timeFilter GROUP BY "device"` is the gap-and-duplicate evidence. A panel
+  for it was deliberately *not* added at stage 13 — the DoD asked for two panels
+  and the plan's rule is that improvements belonging to a later stage get
+  recorded, not implemented. This is that record.
+- **`ts_ms` is millisecond precision and point identity is measurement + tags +
+  timestamp.** Two messages inside one millisecond overwrite, so the dashboard
+  can show a hole the broker never caused. Check `count(distinct ts_ms)` against
+  `count(seq)` before blaming the broker — see "Environment facts learned the
+  hard way" above.
+- **The `device` tag index holds three permanent stage 11 artefacts** —
+  `burst-probe`, `int-probe`, `overwrite-probe` — with no recent points. They stay
+  out of any short-range query for free, but any `SHOW TAG VALUES` listing shows
+  five devices, not two.
+- **Two devices publish at 1 Hz** with independent `seq` counters starting at 1,
+  and the ESP32's loop drifts (1 s plus execution time). Anything that assumes the
+  two are aligned is wrong.
+- **`docker compose build` is only needed when `pyproject.toml` changes.** Stages
+  12 and 13 needed none — but `up -d <service>` silently reuses an old image, so
+  check whether anything Python changed.
 
 ## Open questions
+
+**All stage 13 questions are answered.** One live choice was put to the user and
+decided in conversation: the refresh cadence and time range (5 s / `now-15m`,
+chosen because 5 s is Grafana's own `min_refresh_interval` floor, so
+`compose.yaml` stays untouched and the stage remains pure provisioning).
+
+**Four stage 13 details were decided without consultation** and are flagged as
+such, following the precedent stages 9 and 11 set:
+
+- **`GROUP BY "device"` with no template variable.** A variable would list the
+  three permanent stage 11 artefacts; a short time range excludes them for free.
+- **Raw points, no `GROUP BY time()`.** Bucketing averages a duplicate away and
+  interpolates across a gap, which stages 9 and 18 need to see.
+- **`custom.insertNulls: 3000`**, three times the publish interval, so an outage
+  draws as a break. Observed working against a 10.2 s hole.
+- **`"editable": false`.** Flipping it to `true` is the one-line way to allow
+  scratch edits during a stage 18 investigation; they still cannot be saved.
+
+**Stage 13 closed five things that had been carried as unknown or unstated:**
+Grafana's `min_refresh_interval` floor of 5 s, that `insertNulls` exists in 13.2.2
+with a millisecond threshold and really does break the line, that `$VAR`
+substitution does **not** reach a dashboard JSON although it reaches the
+datasource YAML, that `meta.canSave` stays `true` on a provisioned dashboard while
+the save is refused with HTTP 400, and how to screenshot a dashboard with no
+renderer plugin — the session cookie has to be injected over CDP, because
+credentials in the URL land on the login page.
 
 **All stage 12 questions are answered**, and all four live choices were decided
 in conversation rather than unilaterally: the image tag, whether to declare the

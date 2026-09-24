@@ -1,0 +1,99 @@
+{
+  "uid": "telemetry-live",
+  "title": "Live telemetry",
+  "description": "Stage 13. Temperature and humidity as stored by consumer_store, one series per device, 15 minutes at a 5s refresh. Hand-written, not exported from the UI: an export carries __inputs/${DS_*} placeholders a provisioned dashboard cannot resolve. Edit the file, not the browser — grafana/provisioning/dashboards/telemetry.json.",
+  "id": null,
+  "schemaVersion": 42,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "tags": ["telemetry", "stage13"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Temperature",
+      "description": "SELECT temp_c FROM readings, raw points with no GROUP BY time() and no mean(): at 1 Hz over 15 minutes the panel plots what the pipeline actually stored. Bucketing would average a duplicate away and interpolate across a gap, which is the opposite of what stages 9 and 18 need to see.",
+      "gridPos": { "h": 12, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb-telemetry" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb-telemetry" },
+          "rawQuery": true,
+          "query": "SELECT \"temp_c\" FROM \"readings\" WHERE $timeFilter GROUP BY \"device\"",
+          "resultFormat": "time_series",
+          "alias": "$tag_device"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "insertNulls": 3000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Humidity",
+      "description": "SELECT humidity_pct FROM readings. Same shape as the temperature panel and deliberately side by side rather than stacked, so both traces are visible at once without scrolling while the publisher's output range is changed.",
+      "gridPos": { "h": 12, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "influxdb", "uid": "influxdb-telemetry" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "influxdb", "uid": "influxdb-telemetry" },
+          "rawQuery": true,
+          "query": "SELECT \"humidity_pct\" FROM \"readings\" WHERE $timeFilter GROUP BY \"device\"",
+          "resultFormat": "time_series",
+          "alias": "$tag_device"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "humidity",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "insertNulls": 3000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    }
+  ]
+}

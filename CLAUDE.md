@@ -8,27 +8,22 @@ guarantees; a durable path stores them, an observation path is lossy by design.
 between "gets the pipeline working faster" and "makes broker behaviour visible",
 choose the second. This is not a project optimising for shipping speed.
 
-## Current state — two tracks, no longer independent
+## Current state — both tracks done, one stage left
 
-The plan has a software half (stages 1–13) and a hardware half (14–18). They run
-in parallel and meet only at the payload contract. **There is no single "current
-stage"; a scalar marker cannot describe two tracks.**
+The plan had a software half (stages 1–13) and a hardware half (14–18), run in
+parallel and meeting only at the payload contract. **Both halves are now
+complete.** The two-track bookkeeping is over: stage 18 is the only stage left,
+it needs both halves, and it is the single current stage.
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 12** — Grafana reads the pipeline back. Its datasource is provisioned from `grafana/provisioning/`, and a one-shot `dbrp` service declares the InfluxQL database. Underneath: `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
-| **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
+| **Software** | **Stage 13 — done, the track is finished.** A dashboard provisioned from a file: temperature and humidity, one series per device, 15 minutes at a 5 s refresh, uid `telemetry-live`. Grafana reads the pipeline back. Its datasource is provisioned from `grafana/provisioning/`, and a one-shot `dbrp` service declares the InfluxQL database. Underneath: `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
+| **Hardware** | **Stage 17 — done.** MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. **The DoD's second half is signed off**: the stage 13 dashboard renders `esp32c3-01` alongside `sim-01`, and no firmware rework was needed for it. |
 
-**The two tracks have now met, and the parallelism ends here.** Hardware is done
-through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
-*both* halves, so it cannot start until software reaches stage 13. There is no
-independent hardware work left to schedule.
-
-Next: **stage 13** on the software track — temperature and humidity panels on a
-short time range with a fast refresh, provisioned as a dashboard file rather
-than saved from the UI, since Grafana has no state volume. Stage 17's own DoD
-gets its second half signed off when stage 13 lands — the MCU side is already
-proven and needs no rework for it. Stage 18 then needs both halves.
+Next: **stage 18**, end-to-end resilience. It is the first stage that builds
+nothing — the pipeline is broken deliberately and watched, with the stage 13
+dashboard as the instrument. What to have in hand before starting is recorded
+under "Check first at stage 18" in `src/telemetry/CLAUDE.md`.
 
 **The DBRP mapping did not have to be created.** InfluxDB 2.x synthesises a
 read-only virtual one for any bucket without an explicit mapping, and InfluxQL
