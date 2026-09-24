@@ -49,6 +49,33 @@ EXIT_REJECTED = 3
 # settings.rabbitmq_connect_retry_delay, shared with the initial connect.
 RECONNECT_MAX_DELAY_SECONDS = 30.0
 
+# Heartbeat interval offered to the broker, in seconds. Explicit from stage 11
+# under the explicit-over-inherited rule, and 60 is what pika and RabbitMQ would
+# have negotiated anyway -- the value is not the point, having a stated one is.
+#
+# It became worth stating when consumer_store started writing to InfluxDB inside
+# the pika callback: a blocking write stalls this connection's I/O loop, so no
+# heartbeats go out while it runs, and the write's retry budget has to be sized
+# against something. Stage 8 established only that 35s of blocking did not trip
+# a disconnect, which is a floor, not a number. This makes the number readable:
+# pika sends at half the interval and the broker closes after two are missed, so
+# roughly 120s of silence is fatal, against a worst-case write budget of ~7.5s.
+HEARTBEAT_SECONDS = 60
+
+# Process-wide shutdown flag, set by run_consumer()'s signal handlers.
+#
+# Module scope rather than a local, because a message handler needs to see it:
+# consumer_store sleeps between write retries, and a sleep that ignores SIGTERM
+# makes shutdown cost prefetch x the retry budget -- 10 x 3.5s against compose's
+# 10s grace, which ends in SIGKILL. The handler is built before run_consumer is
+# called and so cannot close over a local; threading it through would change
+# run_consumer's signature for consumer_observe, which has nothing to interrupt.
+#
+# Process-global is honest here: signal.signal() already makes this module's
+# shutdown a per-process affair, and there is exactly one run_consumer per
+# process.
+_stopping = threading.Event()
+
 # Signature pika calls an on_message_callback with. Spelled out because the
 # consumers' handlers must match it exactly and a mismatch surfaces only at
 # delivery time, not at import.
@@ -64,6 +91,33 @@ class BrokerUnreachable(RuntimeError):
 
 class CredentialsRejected(RuntimeError):
     """The broker refused our credentials or vhost permissions."""
+
+
+def is_stopping() -> bool:
+    """True once a shutdown signal has been received.
+
+    Lets a message handler tell "I gave up" from "we are shutting down", which
+    want different endings: the first requeues the delivery explicitly, the
+    second leaves it unacknowledged for stop_consuming() to return to ready.
+    Both put the message back, but only the first should touch a channel that
+    is already closing.
+    """
+    return _stopping.is_set()
+
+
+def sleep_unless_stopping(seconds: float) -> bool:
+    """Sleep, unless a shutdown is already under way or arrives mid-sleep.
+
+    Returns True if the full time elapsed, False if a signal cut it short.
+
+    For blocking work inside a message handler. A bare time.sleep() there is
+    uninterruptible, so on SIGTERM pika still drains its prefetched deliveries
+    through the callback and shutdown costs prefetch x sleep -- measured at
+    stage 8 as exactly that shape. Returning early instead makes the remaining
+    deliveries pass through in microseconds, and stop_consuming() then returns
+    every unacknowledged one to ready.
+    """
+    return not _stopping.wait(seconds)
 
 
 @contextlib.contextmanager
@@ -110,6 +164,9 @@ def connect() -> BlockingConnection:
         # inside ours and multiply the attempts, with only the outer loop
         # visible in the log.
         connection_attempts=1,
+        # Explicit from stage 11, and it matches what would be negotiated --
+        # see HEARTBEAT_SECONDS for why a stated number started to matter.
+        heartbeat=HEARTBEAT_SECONDS,
     )
 
     attempts = settings.rabbitmq_connect_attempts
@@ -239,7 +296,11 @@ def run_consumer(
     host mode, where there is no compose restart policy to catch it -- and the
     project requires host mode for the fast edit-debug loop.
     """
-    stopping = threading.Event()
+    # The module-level flag, not a local: message handlers need to see it too.
+    # Cleared on entry so a second run_consumer() in one process -- which only
+    # the tests do -- does not inherit the previous run's shutdown.
+    stopping = _stopping
+    stopping.clear()
     session = _Session()
 
     def handle_signal(signum, _frame) -> None:

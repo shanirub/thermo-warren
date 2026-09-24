@@ -16,7 +16,7 @@ stage"; a scalar marker cannot describe two tracks.**
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 10** — InfluxDB (`influxdb:2.9`) up, with org `thermo-warren`, bucket `telemetry` and an admin token provisioned at first start. All three dead-letter triggers were demonstrated at stages 7-9 and `telemetry.store` is back to its baseline, so the broker half of the plan is finished. |
+| **Software** | **Stage 11** — `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
 | **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
 **The two tracks have now met, and the parallelism ends here.** Hardware is done
@@ -24,12 +24,16 @@ through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
 *both* halves, so it cannot start until software reaches stage 13. There is no
 independent hardware work left to schedule.
 
-Next: **stage 11** on the software track — the durable consumer's write to
-InfluxDB, inserted between the parse and the ack. That ordering is the whole
-lesson, and the stage's real content is its failure test: stop the storage
-container and decide, deliberately, what a failed write does. Then 12-13.
-Stage 17's own DoD gets its second half signed off when stage 13 lands — the MCU
-side is already proven and needs no rework for it.
+Next: **stage 12** on the software track — Grafana, provisioned from
+version-controlled configuration, plus the DBRP mapping that exposes the bucket
+under a v1-style database name so InfluxQL works. Then 13. Stage 17's own DoD
+gets its second half signed off when stage 13 lands — the MCU side is already
+proven and needs no rework for it.
+
+**The ESP32 is already writing to InfluxDB.** It was powered on during stage 11
+verification, and `esp32c3-01` appears alongside `sim-01` as a second series with
+its own independent `seq`. Nothing had to change for that: the payload contract
+held, and making `device` the only tag was what kept the two apart.
 
 **A note on predicting the next stage.** Stage 6 recorded here that "stage 7 is
 a one-line change by construction". It was not: choosing to validate the whole
@@ -43,9 +47,9 @@ of stages not yet planned.**
 
 | Path | Contents |
 |---|---|
-| `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP plumbing, config — see `src/telemetry/CLAUDE.md` |
+| `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP and storage plumbing, config — see `src/telemetry/CLAUDE.md` |
 | `firmware/` | ESP-IDF project for the ESP32-C3 — see `firmware/CLAUDE.md` |
-| `tests/` | pytest, **no broker required** — keep it that way |
+| `tests/` | pytest, **no broker and no database required** — keep it that way |
 | `compose.yaml` | RabbitMQ, InfluxDB, publisher, consumers |
 | `mcu-rabbitmq-staged-plan.md` | The 18-stage plan, with per-stage Definitions of Done |
 

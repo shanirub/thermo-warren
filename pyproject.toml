@@ -7,12 +7,13 @@ dependencies = [
     "pydantic-settings>=2.0",
     "pika>=1.3",
     "paho-mqtt>=2.0",
+    "influxdb-client>=1.40",
 ]
 
 # Broker, MQTT and storage clients are added at the stage that first needs them:
-#   pika          -> stage 4 (topology declaration)          [added]
-#   paho-mqtt     -> stage 5 (software publisher)             [added]
-#   influxdb-client -> stage 11 (durable consumer writes)
+#   pika            -> stage 4 (topology declaration)        [added]
+#   paho-mqtt       -> stage 5 (software publisher)          [added]
+#   influxdb-client -> stage 11 (durable consumer writes)    [added]
 
 [dependency-groups]
 dev = [

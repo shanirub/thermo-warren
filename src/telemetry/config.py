@@ -94,16 +94,51 @@ class Settings(BaseSettings):
     # acknowledgment, and basic_qos is ignored on such a channel.
     consumer_prefetch_count: int = 10
 
+    # --- Storage (stage 11) -------------------------------------------------
+    # Added at stage 11, not stage 10: the container arrived at 10 but nothing
+    # Python read it until consumer_store writes.
+    #
+    # Every one of these has a default, unlike rabbitmq_host -- and that is a
+    # deliberate departure. Settings is instantiated at import time for EVERY
+    # module, so a required field here would make topology, publisher and
+    # consumer_observe refuse to start without a database token none of them
+    # touches. "Fail loudly by name" survives in storage.connect(), which
+    # rejects an empty token with a message naming INFLUXDB_TOKEN -- in the one
+    # process that actually needs it.
+    #
+    # INFLUXDB_USERNAME/_PASSWORD never become fields at all -- they are the
+    # admin UI login, interpolated by compose only, the same asymmetry
+    # RABBITMQ_VHOST carries in .env.
+    influxdb_url: str = "http://localhost:8086"
+    influxdb_org: str = "thermo-warren"
+    influxdb_bucket: str = "telemetry"
+    influxdb_token: str = ""
+
+    # Milliseconds because that is influxdb-client's own unit for this
+    # parameter -- verified in InfluxDBClient.__init__, which documents
+    # "timeout setting for a request specified in milliseconds" and defaults it
+    # to 10_000. Stated explicitly at a fifth of that, because the write blocks
+    # inside the pika callback: the worst case is
+    # influxdb_write_attempts x this, and that whole budget stalls the AMQP I/O
+    # loop and stops heartbeats going out while it runs.
+    #
+    # Only reachable when the server accepts the connection and then does not
+    # answer (`docker pause`). A stopped container refuses in microseconds and
+    # never touches this value.
+    influxdb_timeout_ms: int = 2000
+
+    # The write's retry budget, mirroring rabbitmq_connect_attempts /
+    # _retry_delay above: attempts and base delay are configuration, the
+    # doubling is in the code. The delay is applied after EVERY failed attempt
+    # including the last, so 3 attempts cost 0.5 + 1 + 2 = 3.5s of backoff
+    # before the message is requeued -- that final sleep is what stops the
+    # requeue becoming a hot redelivery loop while storage is down.
+    influxdb_write_attempts: int = 3
+    influxdb_write_retry_delay: float = 0.5
+
     # --- Later stages ------------------------------------------------------
     # Topology names and queue arguments              -> topology_spec.py
-    # InfluxDB url / org / bucket / token             -> stage 11
-    #
-    # Stage 11, not stage 10: the container arrives at 10 but nothing Python
-    # reads it until consumer_store writes. A required field here would make
-    # topology, publisher and consumer_observe refuse to start without a
-    # database token none of them touches. INFLUXDB_USERNAME/_PASSWORD never
-    # become fields at all -- they are the admin UI login, interpolated by
-    # compose only, the same asymmetry RABBITMQ_VHOST carries in .env.
+    # The storage schema (measurement, tags, fields)  -> storage.py
 
     @property
     def amqp_url(self) -> str:
@@ -130,6 +165,13 @@ class Settings(BaseSettings):
             f"  device_id            = {self.device_id}",
             f"  publish_interval_s   = {self.publish_interval_seconds}",
             f"  consumer_prefetch    = {self.consumer_prefetch_count}",
+            f"  influxdb_url         = {self.influxdb_url}",
+            f"  influxdb_org         = {self.influxdb_org}",
+            f"  influxdb_bucket      = {self.influxdb_bucket}",
+            f"  influxdb_token       = {'*' * 8 if self.influxdb_token else '(empty)'}",
+            f"  influxdb_timeout_ms  = {self.influxdb_timeout_ms}",
+            f"  influxdb_write_tries = {self.influxdb_write_attempts}",
+            f"  influxdb_write_delay = {self.influxdb_write_retry_delay}s",
         ]
         return "\n".join(lines)
 

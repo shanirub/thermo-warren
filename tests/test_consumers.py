@@ -16,10 +16,13 @@ import re
 from unittest.mock import MagicMock
 
 import pytest
+from influxdb_client.client.exceptions import InfluxDBError
+from urllib3.exceptions import HTTPError
 
 from telemetry import amqp
 from telemetry import consumer_observe as observe
 from telemetry import consumer_store as store
+from telemetry import storage
 from telemetry import topology_spec as spec
 from telemetry.config import settings
 
@@ -82,11 +85,28 @@ def runner(monkeypatch):
     which detaches every existing root handler -- including the one caplog
     installs -- so without this the log assertions below see an empty capture
     while the lines themselves appear on stderr.
+
+    From stage 11 it also stands in for storage. `write_api` in the returned
+    dict is the mock the handler writes through, so a test can assert on the
+    point that was built, or give it a side effect to simulate an outage.
+    storage.to_point() and storage.write() themselves are NOT mocked -- the real
+    mapping runs, against a mock that only records the call.
+
+    sleep_unless_stopping is replaced with a no-op that reports "slept", so the
+    retry tests cost no wall-clock time. The interruption path is tested by
+    overriding it again, per test.
     """
     calls = {}
 
     monkeypatch.setattr(observe, "configure_logging", lambda: None)
     monkeypatch.setattr(store, "configure_logging", lambda: None)
+
+    write_api = MagicMock(name="write_api")
+    monkeypatch.setattr(store.storage, "connect", lambda: MagicMock(name="client"))
+    monkeypatch.setattr(store.storage, "write_api", lambda client: write_api)
+    monkeypatch.setattr(store, "sleep_unless_stopping", lambda seconds: True)
+    monkeypatch.setattr(store, "is_stopping", lambda: False)
+    calls["write_api"] = write_api
 
     def fake_run_consumer(queue, on_message, *, auto_ack, prefetch_count):
         calls.update(
@@ -379,3 +399,249 @@ def test_run_consumer_skips_basic_qos_when_prefetch_is_none():
 
     channel.basic_qos.assert_not_called()
     assert channel.basic_consume.call_args.kwargs["auto_ack"] is True
+
+
+# --- Stage 11: the write goes between the parse and the ack ------------------
+
+
+def test_store_writes_before_it_acknowledges(runner):
+    # The ordering IS the stage. Acking first would lose the message if the
+    # process died in between; acking after means it is redelivered. Asserted
+    # as an ordering, not just as "both happened", because both happening in
+    # the wrong order is exactly the bug that would still pass a naive test.
+    store.main([])
+    channel = MagicMock()
+    order = []
+    runner["write_api"].write.side_effect = lambda **kw: order.append("write")
+    channel.basic_ack.side_effect = lambda **kw: order.append("ack")
+
+    runner["on_message"](channel, delivery(), MagicMock(), WELL_FORMED)
+
+    assert order == ["write", "ack"]
+
+
+def test_store_writes_the_agreed_schema(runner):
+    # storage.to_point() is not mocked, so this asserts the real mapping:
+    # measurement, the single tag, the three fields and the ms timestamp.
+    store.main([])
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+
+    kwargs = runner["write_api"].write.call_args.kwargs
+    line = kwargs["record"].to_line_protocol()
+
+    assert line.startswith("readings,device=sim-01 ")
+    assert "temp_c=24" in line
+    assert "seq=42i" in line
+    assert line.endswith(" 1756400000123")
+    # Omitting this means nanoseconds, which would silently put every point in
+    # January 1970 -- see storage.WRITE_PRECISION.
+    assert kwargs["write_precision"] == storage.WritePrecision.MS
+
+
+def test_store_coerces_an_integer_reading_to_a_float_field(runner):
+    # payload.parse() tolerates a JSON integer for temp_c, because
+    # json.loads("29") is an int and a strict check would dead-letter good
+    # readings after a publisher format-string change. InfluxDB field types are
+    # fixed by first write, so that tolerance must not reach storage: without
+    # the float() in to_point() this serializes as `temp_c=29i`.
+    store.main([])
+    body = json.dumps(
+        {"seq": 7, "device": "sim-01", "temp_c": 29,
+         "humidity_pct": 60, "ts_ms": 1756400000123}
+    ).encode()
+
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), body)
+
+    line = runner["write_api"].write.call_args.kwargs["record"].to_line_protocol()
+    assert "temp_c=29i" not in line
+    assert "temp_c=29" in line
+    assert "humidity_pct=60i" not in line
+    # seq stays an integer field, deliberately.
+    assert "seq=7i" in line
+
+
+def test_store_does_not_acknowledge_a_message_it_could_not_write(runner):
+    # The whole point of writing before acking: a failed write must not settle
+    # the delivery as though it had been stored.
+    store.main([])
+    channel = MagicMock()
+    runner["write_api"].write.side_effect = HTTPError("connection refused")
+
+    runner["on_message"](channel, delivery(tag=31), MagicMock(), WELL_FORMED)
+
+    channel.basic_ack.assert_not_called()
+
+
+def test_store_requeues_rather_than_dead_letters_on_a_write_failure(runner):
+    # telemetry.dlq means "failed the payload contract" and nothing else. A
+    # good reading that arrived during a storage outage is not poison, and
+    # x-death has no room to record which it was.
+    store.main([])
+    channel = MagicMock()
+    runner["write_api"].write.side_effect = HTTPError("connection refused")
+
+    runner["on_message"](channel, delivery(tag=31), MagicMock(), WELL_FORMED)
+
+    channel.basic_reject.assert_called_once_with(delivery_tag=31, requeue=True)
+
+
+def test_store_catches_urllib3_errors_not_just_influxdb_ones(runner):
+    # Verified against influxdb-client 1.50.0: with retries=False a refused
+    # connection surfaces as urllib3's NewConnectionError, NOT as an
+    # InfluxDBError. Catching only the library's own exception would let the
+    # exact case the stage's failure test produces escape the handler.
+    store.main([])
+
+    for exc in (HTTPError("urllib3 side"), InfluxDBError(message="library side")):
+        channel = MagicMock()
+        runner["write_api"].write.side_effect = exc
+        runner["on_message"](channel, delivery(tag=32), MagicMock(), WELL_FORMED)
+        channel.basic_reject.assert_called_once_with(delivery_tag=32, requeue=True)
+
+
+def test_store_retries_the_configured_number_of_times(runner):
+    store.main([])
+    runner["write_api"].write.side_effect = HTTPError("down")
+
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+
+    assert runner["write_api"].write.call_count == settings.influxdb_write_attempts
+
+
+def test_store_acknowledges_when_a_retry_succeeds(runner):
+    # A transient failure must not cost the message: two failures then a
+    # success ends in an ack, not a requeue.
+    store.main([])
+    channel = MagicMock()
+    runner["write_api"].write.side_effect = [HTTPError("down"), HTTPError("down"), None]
+
+    runner["on_message"](channel, delivery(tag=33), MagicMock(), WELL_FORMED)
+
+    channel.basic_ack.assert_called_once_with(delivery_tag=33)
+    channel.basic_reject.assert_not_called()
+
+
+def test_store_backs_off_after_every_failed_attempt_including_the_last(runner,
+                                                                      monkeypatch):
+    # The final sleep is what paces the requeue. Without it the message comes
+    # straight back as a redelivery with nothing slowing it down, and a storage
+    # outage becomes the hot loop --requeue-poison exists to demonstrate.
+    slept = []
+    monkeypatch.setattr(store, "sleep_unless_stopping",
+                        lambda seconds: slept.append(seconds) or True)
+    store.main([])
+    runner["write_api"].write.side_effect = HTTPError("down")
+
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+
+    base = settings.influxdb_write_retry_delay
+    assert slept == [base, base * 2, base * 4]
+
+
+def test_store_abandons_the_retry_and_leaves_it_unacked_on_shutdown(runner,
+                                                                    monkeypatch):
+    # An uninterruptible sleep would make shutdown cost prefetch x the retry
+    # budget -- 10 x 3.5s against compose's 10s grace, which ends in SIGKILL.
+    # Cut short, the delivery is left unacknowledged and stop_consuming() puts
+    # it back in ready; it must NOT be rejected on a channel that is closing.
+    monkeypatch.setattr(store, "sleep_unless_stopping", lambda seconds: False)
+    monkeypatch.setattr(store, "is_stopping", lambda: True)
+    store.main([])
+    channel = MagicMock()
+    runner["write_api"].write.side_effect = HTTPError("down")
+
+    runner["on_message"](channel, delivery(), MagicMock(), WELL_FORMED)
+
+    assert runner["write_api"].write.call_count == 1
+    channel.basic_ack.assert_not_called()
+    channel.basic_reject.assert_not_called()
+
+
+def test_store_logs_a_redelivery_only_after_the_write_succeeded(runner, caplog):
+    # On the success path deliberately. Every requeue above comes back with
+    # redelivered set, so logging before the write would fill an outage with
+    # lines about writes that never happened.
+    store.main([])
+    method = delivery()
+    method.redelivered = True
+
+    runner["write_api"].write.side_effect = HTTPError("down")
+    with caplog.at_level(logging.WARNING):
+        runner["on_message"](MagicMock(), method, MagicMock(), WELL_FORMED)
+    assert "redelivered, point overwritten" not in caplog.text
+
+    caplog.clear()
+    runner["write_api"].write.side_effect = None
+    with caplog.at_level(logging.WARNING):
+        runner["on_message"](MagicMock(), method, MagicMock(), WELL_FORMED)
+    assert "redelivered, point overwritten" in caplog.text
+
+
+def test_store_does_not_write_a_poison_message(runner):
+    # Stage 7 validates the contract before the write precisely so that stage
+    # 11's failure test has one variable. A malformed body must never reach
+    # storage.
+    store.main([])
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), MALFORMED)
+    runner["write_api"].write.assert_not_called()
+
+
+def test_store_skips_the_write_entirely_when_shutting_down_with_storage_down(
+    runner, monkeypatch
+):
+    # Measured, not theoretical: an interruptible backoff alone still left
+    # shutdown costing one write timeout per prefetched delivery -- 10 x 2s
+    # against compose's 10s grace -- and SIGTERM during a *paused* storage was
+    # killed with exit 137. Once one message has proved storage is not
+    # answering, the rest of the drained batch must not attempt a write at all.
+    store.main([])
+    runner["write_api"].write.side_effect = HTTPError("down")
+
+    # First message exhausts the budget and sets the flag.
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+    calls_after_first = runner["write_api"].write.call_count
+    assert calls_after_first == settings.influxdb_write_attempts
+
+    # Now SIGTERM arrives.
+    monkeypatch.setattr(store, "is_stopping", lambda: True)
+    channel = MagicMock()
+    runner["on_message"](channel, delivery(), MagicMock(), WELL_FORMED)
+
+    # Not one further attempt, and the delivery is left for stop_consuming().
+    assert runner["write_api"].write.call_count == calls_after_first
+    channel.basic_ack.assert_not_called()
+    channel.basic_reject.assert_not_called()
+
+
+def test_store_still_writes_its_prefetched_batch_on_a_normal_shutdown(
+    runner, monkeypatch
+):
+    # The guard above is conditional on storage being known bad, deliberately.
+    # A healthy shutdown must still drain and ack, or every restart would return
+    # ten writable messages to ready and log ten "redelivered" warnings, which
+    # would drain that warning of its meaning.
+    store.main([])
+    monkeypatch.setattr(store, "is_stopping", lambda: True)
+    channel = MagicMock()
+
+    runner["on_message"](channel, delivery(tag=40), MagicMock(), WELL_FORMED)
+
+    runner["write_api"].write.assert_called_once()
+    channel.basic_ack.assert_called_once_with(delivery_tag=40)
+
+
+def test_store_clears_the_down_flag_once_a_write_succeeds(runner, monkeypatch):
+    # Otherwise a single outage would permanently disable writes on shutdown for
+    # the life of the process.
+    store.main([])
+    runner["write_api"].write.side_effect = HTTPError("down")
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+
+    runner["write_api"].write.side_effect = None
+    runner["on_message"](MagicMock(), delivery(), MagicMock(), WELL_FORMED)
+
+    monkeypatch.setattr(store, "is_stopping", lambda: True)
+    channel = MagicMock()
+    runner["on_message"](channel, delivery(tag=41), MagicMock(), WELL_FORMED)
+
+    channel.basic_ack.assert_called_once_with(delivery_tag=41)

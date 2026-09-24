@@ -63,10 +63,11 @@ services:
     restart: unless-stopped
 
   # -------------------------------------------------------------- storage ---
-  # Stage 10. Nothing reads or writes it yet -- consumer_store gains the write
-  # at stage 11 and Grafana the read at stage 12. It is declared now so that
-  # stage 11 is a consumer change against a database already proven to work,
-  # rather than two new things failing at once.
+  # Stage 10. consumer_store writes to it from stage 11; Grafana reads from
+  # stage 12. Declared a stage before anything used it, deliberately, so that
+  # stage 11 was a consumer change against a database already proven to work
+  # rather than two new things failing at once -- which is what let the stage 11
+  # failure test be about the outage and nothing else.
   influxdb:
     # Floating across patch releases, exactly like rabbitmq:4.3-management
     # above. 2.9 is also the first line that hashes tokens on disk, which is
@@ -202,9 +203,24 @@ services:
         # exchange with no matching binding discards silently, so this gate
         # replaces discipline with enforcement.
         condition: service_completed_successfully
+      influxdb:
+        # Added at stage 11, when this became the only service that writes to
+        # storage. service_healthy, not service_started, and that is why the
+        # influxdb healthcheck above was written as readiness rather than
+        # liveness: first start is two-phase and 8086 does not listen at all
+        # while `influx setup` runs against the temporary server on 9999.
+        #
+        # Not fatal if it were missing -- the write retry and requeue would
+        # cover the gap -- but every message published during the window would
+        # take 3.5s of backoff first, for no reason.
+        condition: service_healthy
     env_file: .env
     environment:
       RABBITMQ_HOST: rabbitmq
+      # Same override shape as RABBITMQ_HOST: .env carries the host-mode value
+      # (127.0.0.1:8086, the published port), and inside the compose network the
+      # service name resolves instead. The container port is 8086 either way.
+      INFLUXDB_URL: http://influxdb:8086
     volumes:
       - ./src:/app/src
     # Long-lived from stage 6, like publisher. --ack-delay is deliberately not

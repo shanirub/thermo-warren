@@ -7,7 +7,7 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 10 done and verified.** Next is stage 11.
+**Software track state: stage 11 done and verified.** Next is stage 12.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
 the payload contract. **All three dead-letter triggers are now demonstrated** —
@@ -17,9 +17,9 @@ nothing else; stages 8 and 9 each added an argument, measured it, and removed it
 again. Shared AMQP plumbing lives in `amqp.py`; the payload contract lives in
 `payload.py`.
 
-**InfluxDB is up and provisioned but nothing speaks to it yet** — stage 10 added
-a container, not code. `consumer_store` gains the write at stage 11, Grafana the
-read at stage 12.
+**`consumer_store` now writes to InfluxDB between the parse and the ack**, and
+the pipeline is at-least-once end to end. Storage plumbing lives in
+`storage.py`; Grafana gets the read at stage 12.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -56,6 +56,15 @@ read at stage 12.
 The rule: **`config.py` holds what differs between run modes** (endpoints,
 credentials, this process's own behaviour). **`topology_spec.py` holds what the
 broker enforces** (names, queue arguments).
+
+**`storage.py` (stage 11) is the fourth home, and it holds almost nothing.** The
+measurement name, which payload fields are tags rather than fields, and the
+write precision — three constants that are none of "differs between run modes",
+"the broker enforces it" or "publisher and consumers must agree on it". Every
+*key name* is imported from `payload.py` rather than re-spelled, which is the
+module's one rule: a renamed field would otherwise still write, just into a
+differently-named column, with no error anywhere. The endpoint, org, bucket and
+token do differ between run modes and so live in `config.py` as usual.
 
 The reasoning matters. A wrong hostname fails loudly by name; a wrong routing key
 fails **silently** — both queues stay empty forever with no error anywhere.
@@ -189,8 +198,9 @@ longer only a document.
 
 - **`seq`** — integer, monotonic, restarts at 1 each process run. Deliberately
   **not** globally unique across restarts.
-- **`device`** — distinguishes simulator from ESP32; becomes an InfluxDB tag at
-  stage 11.
+- **`device`** — distinguishes simulator from ESP32. **It is the InfluxDB tag**
+  from stage 11, and the only one, so it is what keeps `sim-01` and
+  `esp32c3-01` in separate series with independent `seq` counters.
 - **`temp_c` / `humidity_pct`** — **floats**, units in the field name, matching
   `dht_read_float_data()` so stage 17 needs no type conversion. Unchanged since
   stage 5; this is what a publisher is obliged to emit.
@@ -205,14 +215,19 @@ longer only a document.
   Both must be **finite**. Python's `json` accepts `NaN` and `Infinity`, which
   pass every `isinstance` check and fail only at the storage write.
 
-  **Unverified, and it belongs to stage 11:** InfluxDB fields are typed, and a
-  field first written as a float rejects a later integer with a field-type
-  conflict. The `influxdb-client` mapping from Python `int` is expected to
-  produce an integer field, so the tolerance above could let through a value
-  that the write then refuses. Expected, **not checked** — stage 10 brought an
-  InfluxDB up, so this is now testable rather than hypothetical, but nothing
-  writes to it yet. If it holds, stage 11's write coerces with `float()` and the
-  tolerance stays purely a dead-lettering decision.
+  **Answered at stage 11, and the prediction held.** Both halves are now
+  measured. `Point.field("temp_c", 29)` serializes as `temp_c=29i` — an
+  *integer* field — while `float(29)` gives `temp_c=29`. And InfluxDB rejects an
+  integer written to an established float field with **HTTP 422**
+  (`ApiException`). So the tolerance would genuinely have reached storage.
+
+  `storage.to_point()` coerces with `float()`, which keeps the tolerance a
+  dead-lettering decision rather than a storage one, exactly as predicted.
+  **Worth knowing what the coercion prevents:** `ApiException` subclasses
+  `InfluxDBError` and so is caught by `storage.WRITE_FAILURES`, meaning an
+  uncoerced integer would be retried three times and requeued — forever, on a
+  message that can never be stored. A permanent failure dressed as a transient
+  one.
 - **`ts_ms`** — epoch **milliseconds**, publisher-stamped. Milliseconds
   specifically because InfluxDB point identity is measurement + tag set +
   timestamp, so points sharing a timestamp overwrite rather than accumulate; at
@@ -421,17 +436,17 @@ visible in shell history, impossible to leave switched on, unreachable from a
 normal `docker compose up`. `consumer_observe` has no ack to delay.
 
 **It is a blocking `time.sleep()` inside the pika callback, which stalls the
-I/O loop and stops heartbeats.** At 2 s, harmless. Past the negotiated heartbeat
-interval it reproduces an unexplained broker disconnect — which is precisely the
-hazard stage 11 has to design the storage write around. The flag can demonstrate
-it on demand.
+I/O loop and stops heartbeats.** At 2 s, harmless. Past the heartbeat interval
+it reproduces an unexplained broker disconnect — the hazard stage 11's storage
+write had to be designed around, and the flag still reproduces it on demand.
+That interval is no longer merely "negotiated": `HEARTBEAT_SECONDS = 60` is
+explicit from stage 11.
 
-### Where stage 11 goes
+### Where the stage 11 write went
 
-`consumer_store.build_handler()` marks the insertion point in a comment: after
-the parse, **before** the ack. Acknowledging first loses the message on a crash
-between the two; acknowledging after redelivers it. That ordering is what makes
-the pipeline at-least-once end to end.
+After the parse, **before** the ack, in `consumer_store.build_handler()`.
+Acknowledging first would lose the message if the process died between the two;
+acknowledging after redelivers it. See "Storage writes (stage 11)" below.
 
 ### Stage 6 DoD — verified against real behaviour
 
@@ -647,12 +662,17 @@ shutdown is **`consumer_prefetch_count` x callback duration** — here 10 x 35 s
 
 The production consequence: compose sends SIGTERM and waits **10 s** before
 SIGKILL. Any callback slow enough to matter, with a prefetch of 10, cannot
-finish draining in 10 s, so `docker compose stop` will always end in a SIGKILL
-and an unclean stop. Nothing is lost — unacknowledged messages return to ready —
-but every stop looks like a crash. **Stage 11 should decide deliberately**
-whether to shorten the prefetch, bound the write, or raise
-`stop_grace_period`, rather than discovering this when the storage write turns
-out to be slow.
+finish draining in 10 s, so `docker compose stop` ends in a SIGKILL and an
+unclean stop. Nothing is lost — unacknowledged messages return to ready — but
+every stop looks like a crash.
+
+**Answered at stage 11, and none of the three options listed here was the
+answer.** Prefetch stayed at 10 and `stop_grace_period` was left alone; instead
+the callback learned to *abandon* its work on SIGTERM. Both halves were needed:
+an interruptible backoff, and then — because that alone still cost one write
+timeout per prefetched delivery and died at exit 137 — skipping the write
+entirely once storage is known bad. Measured at 1.2 s and exit 0. See "The
+shutdown budget" under "Storage writes (stage 11)".
 
 ## Overflow (stage 9, implemented and verified)
 
@@ -777,8 +797,8 @@ A finite retention is the storage-layer echo of stage 8's queue TTL if it is
 ever wanted as its own exercise — **recorded, not scheduled**.
 
 Consequence, accepted: the point written by hand at stage 10 is **permanent**.
-It is named `stage10_check`, not the measurement stage 11 will choose, so it can
-never be mistaken for real telemetry. `influx delete --predicate` removes it.
+It is named `stage10_check`, not `readings` (the measurement stage 11 chose), so
+it can never be mistaken for real telemetry. `influx delete --predicate` removes it.
 
 ### One admin token, and why a scoped one was not possible here
 
@@ -852,6 +872,163 @@ token. `down -v` takes both, which is the only always-coherent combination.
 | `down` (no `-v`) then `up` | bucket and point both survive; setup does not re-run |
 | Healthcheck auth noise | **zero** `401`/`unauthorized` lines |
 | Tests still green with no broker | 85/85, unchanged |
+
+## Storage writes (stage 11, implemented and verified)
+
+`consumer_store` writes each reading to InfluxDB between the parse and the ack.
+New module `storage.py`, new dependency `influxdb-client` (1.50.0 installed),
+seven new `config.py` fields, and a `depends_on` gate in compose.
+
+### The schema
+
+| Thing | Value |
+|---|---|
+| Measurement | `readings` |
+| Tag | `device` — the only one |
+| Fields | `temp_c`, `humidity_pct` (floats), `seq` (integer) |
+| Timestamp | `ts_ms`, millisecond precision |
+
+- **`readings`, not `telemetry`.** That word already names the bucket, the queue
+  prefix and (from stage 12) the InfluxQL database, so the measurement would read
+  as `FROM telemetry` in database `telemetry` in every query. `readings` names
+  what one row is — the same principle that named the queues after what their
+  consumers do.
+- **`seq` is a field, not a tag.** Tag values are indexed and every distinct tag
+  set is a series; `seq` is monotonic and unbounded, so tagging it would create
+  one series per message (~86,400/day at 1 Hz) against a bucket whose retention
+  is infinite. As a field it is still selectable and still the gap-and-duplicate
+  evidence stage 18 wants.
+- **`device` as the only tag pays off immediately.** The ESP32 was live during
+  stage 11 verification, and `esp32c3-01` and `sim-01` each carry their own
+  independent `seq` counter starting at 1. They do not collide, because the tag
+  set separates the series. A per-device gap analysis over both came back with
+  **zero gaps and zero same-`seq` collisions**.
+
+### Synchronous, and blocking inside the pika callback
+
+- **`SYNCHRONOUS` is a requirement, not a tuning choice.** The batching write API
+  returns once the point is buffered and flushes later on its own thread, so
+  acking after it would ack before any confirmation exists — and would fail
+  *silently*, looking correct until an outage.
+- **The write blocks the AMQP I/O loop**, deliberately, rather than moving to a
+  worker thread. Ack-after-write stays four readable lines, and the stalled-loop
+  hazard stage 8 set up stays visible. A worker thread would have made stage 11 a
+  concurrency stage.
+
+### The failure policy: retry, then requeue — never dead-letter
+
+Three attempts, backoff `0.5 → 1 → 2 s`, then `basic_reject(requeue=True)`.
+
+- **The DLQ keeps meaning exactly one thing**: this message failed the payload
+  contract. A good reading that arrived during an outage is not poison, `x-death`
+  has no room for our reason, and a bounded-then-dead-letter policy would start
+  discarding valid data the moment an outage outlasted the budget — surfacing as
+  a hole in the stage 13 dashboard.
+- **The backoff sleeps after every failed attempt, the last one included.** That
+  final 2 s is what paces the requeue; without it the message returns
+  immediately and a storage outage becomes the hot loop `--requeue-poison`
+  exists to demonstrate.
+- **Every sleep is interruptible** via `amqp.sleep_unless_stopping()`.
+- **Auth and schema failures are treated identically to an outage**, on purpose.
+  A 401 or a 422 retries and requeues forever with a loud log rather than being
+  classified as permanent. The uniform path is simpler, loses nothing, and the
+  backoff paces what would otherwise be a hot loop; the cost is that a genuinely
+  permanent failure never resolves itself.
+
+### The shutdown budget, which needed two fixes rather than one
+
+**Measured, and the first fix was not enough.** Stage 8 recorded that shutdown
+costs `prefetch × callback duration`. Making the backoff interruptible was the
+obvious fix and it was insufficient: SIGTERM while storage was **paused** still
+took the full 10 s grace and died with **exit 137**, because pika drains its
+prefetched deliveries through the callback and each one paid a full 2 s write
+timeout *before* the handler could notice the shutdown. 10 × 2 s against a 10 s
+grace.
+
+The second fix is a `storage_down` flag in the handler closure: once one message
+has exhausted its budget, a shutdown skips the write attempt outright. Re-measured
+at **1.2 s and exit 0**, with the whole prefetched batch returned to ready inside
+the same millisecond.
+
+**Conditional on the flag, not on `is_stopping()` alone**, so a normal shutdown
+still writes and acks its prefetched batch. Skipping those would return ten
+perfectly writable messages to ready on every restart and log ten `redelivered`
+warnings, draining that warning of the meaning it was added to carry.
+
+### Duplicates: overwrite, no dedup state, logged on success
+
+**Verified**: three writes of one identity produce **one point**, holding the
+last value. Point identity is measurement + tag set + timestamp, so an
+at-least-once redelivery is idempotent by construction — which is what the
+publisher-stamped `ts_ms` bought at stage 5. No dedup machinery exists and none
+is wanted; a seen-set would need bounding, would be lost on restart exactly when
+duplicates occur, and `seq` restarts at 1 each publisher run so it would be
+unsound anyway.
+
+A `redelivered` WARNING is logged **on the success path only**. Every requeue
+comes back with `redelivered` set, so logging before the write would fill an
+outage with lines about writes that never happened. **Verified**: a restart
+during an outage produced exactly **10** of them — `consumer_prefetch_count`,
+confirming stage 6's claim that prefetch *is* the duplicate window.
+
+### Explicit heartbeat, and why it arrived now
+
+`amqp.connect()` passes `heartbeat=60` explicitly (`HEARTBEAT_SECONDS`). It
+matches what would have been negotiated; the point is having a stated number to
+size the blocking write against, instead of stage 8's unmeasured "above 35 s".
+pika sends at half the interval and the broker closes after two are missed, so
+roughly 120 s of silence is fatal against a worst-case write budget of ~7.5 s.
+
+**Verified**: 4.5 minutes of continuous 7.5 s stalls (storage paused) produced
+**zero** connection losses, cancels or reconnects, with the consumer still
+attached and unacked pinned at 10 throughout. This closes the
+explicit-over-inherited gap carried since stage 6.
+
+### Configuration
+
+Seven fields, and **every one has a default** — a deliberate departure from
+`rabbitmq_host`, which has none. `Settings` is instantiated at import for every
+module, so a required field would make `topology`, `publisher` and
+`consumer_observe` refuse to start without a token none of them touches. "Fail
+loudly by name" survives in `storage.connect()`, which rejects an empty token
+with a message naming `INFLUXDB_TOKEN`, in the one process that needs it.
+
+`influxdb_timeout_ms = 2000` (a fifth of the library default) because the write
+blocks the I/O loop. `influxdb_write_attempts` / `_retry_delay` mirror
+`rabbitmq_connect_attempts` / `_retry_delay`: attempts and base delay are
+configuration, the doubling is in the code.
+
+**`EXIT_UNCONFIGURED = 5`** is local to `consumer_store`, exactly as `topology.py`
+owns `EXIT_MISMATCH = 4`. Distinct from 3, which is the *broker* refusing
+credentials that were supplied.
+
+### compose
+
+`consumer-store` gains `depends_on: influxdb: condition: service_healthy`, which
+is what stage 10's readiness-style healthcheck was written for. Not load-bearing
+— the retry and requeue would cover the gap — but without it every message
+published during the startup window pays 3.5 s of backoff for nothing.
+`INFLUXDB_URL: http://influxdb:8086` overrides the host-mode value in `.env`, the
+same shape as `RABBITMQ_HOST`.
+
+**Observed as a side effect**: after `docker unpause`, the gate refuses to start
+`consumer-store` until the healthcheck recovers, reporting `dependency failed to
+start: container ... is unhealthy`. Correct behaviour, but it looks like a
+failure — wait for health rather than retrying the command.
+
+### Stage 11 DoD — verified against real behaviour
+
+| Check | Result |
+|---|---|
+| Points appear in near-real-time | `_time` correct to the millisecond, `seq` typed `long`, `temp_c` typed `double` |
+| Logged `seq` == stored `seq` | 119 vs 119 over a 150 s window, no gaps, sets identical |
+| Ack strictly follows a confirmed write | Asserted as an ordering in tests; proved live by the outage, where the queue did **not** drain |
+| Outage: `docker compose stop influxdb` | 3 attempts at 0.5/1/2 s, requeue; `telemetry.store` grew to 486 ready with unacked pinned at **10**; `telemetry.dlq` **0**; `telemetry.observe` untouched |
+| Nothing silently lost | Both devices: **zero gaps**, zero same-`seq` duplicates, across the whole outage |
+| Outage: `docker pause influxdb` | `ReadTimeoutError` at **1.999 s**, cycle ~7.5 s, no heartbeat loss over 4.5 min |
+| SIGTERM during an outage | **1.2 s, exit 0** after the `storage_down` fix (was 10.2 s, exit 137) |
+| Recovery | Queues drain to 0, exactly 10 `redelivered` warnings, DLQ still 0 |
+| Tests with nothing running | **114/114**, no broker and no InfluxDB |
 
 ## Logging, errors, testing
 
@@ -931,10 +1108,13 @@ token. `down -v` takes both, which is the only always-coherent combination.
   socket — liveness, not correctness.
 - `topology` stays one-shot permanently. `publisher` is long-lived
   (`restart: unless-stopped`) from stage 5.
-- **`influxdb` (stage 10) gates nothing yet** — no `depends_on` points at it,
-  because nothing reads or writes it until stage 11. Its healthcheck was still
-  written as readiness rather than liveness, so that wiring is a one-line change
-  when it lands. Full reasoning in "Storage (stage 10)" above.
+- **`influxdb` gates `consumer-store`** from stage 11
+  (`condition: service_healthy`), which is what its readiness-style healthcheck
+  was written for at stage 10. Not load-bearing — the write retry and requeue
+  would cover the gap — but without it every message published during the
+  startup window pays 3.5 s of backoff for nothing. Note the gate also refuses
+  to start `consumer-store` while `influxdb` is merely *recovering*, e.g. right
+  after a `docker unpause`; wait for health rather than retrying the command.
 
 ### Running the stack
 
@@ -1204,43 +1384,88 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   *sequence*, not merely a slow boot. 30 s is comfortable — the measured cold
   `up -d --wait` was 12 s.
 
-## Check first at stage 11
+- **`influxdb-client`'s `write_precision` defaults to `'ns'`, and the Point's own
+  precision does not rewrite the number.** Verified in 1.50.0: an int timestamp
+  is serialized verbatim at every serialization precision, so the only thing that
+  assigns meaning to `1756400000123` is the query parameter `WriteApi.write()`
+  sends. Left at the default, every point lands in **January 1970** with no error
+  anywhere. `storage.write()` passes `WritePrecision.MS` explicitly for this
+  reason alone.
+- **A failed write does not necessarily raise the library's own exception.**
+  With `retries=False`, urllib3's exceptions reach the caller unwrapped:
+  a stopped *container* gives `NameResolutionError` (compose removes it from the
+  network's DNS, so the hostname fails before any connection is attempted), a
+  stopped *process* on a reachable host gives `NewConnectionError`, and a paused
+  container gives `ReadTimeoutError`. All three subclass
+  `urllib3.exceptions.HTTPError`; the library's `ApiException` subclasses
+  `InfluxDBError`. Hence `storage.WRITE_FAILURES` is a two-tuple — catching only
+  `InfluxDBError` would miss every outage shape.
+- **A burst collapses in storage, and the broker is blameless.** `--burst 200`
+  published 200 messages in **7 milliseconds**; all 200 were delivered, consumed
+  and written (queues drained, DLQ empty), and **7 points** survived — one per
+  distinct millisecond, each holding the last `seq` written in that millisecond.
+  Roughly 29 messages per millisecond overwriting one another.
 
-**Stage 11 is the first stage since 7 that writes Python against a live
-dependency.** It inserts the InfluxDB write between the parse and the ack in
-`consumer_store.build_handler()`, where a comment already marks the spot.
+  This is stage 5's reasoning arriving at its limit rather than being wrong: it
+  chose milliseconds because "at second resolution a stage 9 burst would silently
+  collapse", and that is exactly what milliseconds do to a *tight* burst too. At
+  the 1 Hz steady state the margin is 1000x and it is a non-issue.
 
-**`config.py` grows its InfluxDB fields here, not at stage 10.** The keys
-already exist in `.env` and `.env.example` (`INFLUXDB_URL`, `_ORG`, `_BUCKET`,
-`_TOKEN`); the class does not. `INFLUXDB_USERNAME`/`_PASSWORD` never become
-fields — they are the admin UI login, interpolated by compose only.
-`pyproject.toml` gains `influxdb-client`, so **run `docker compose build`
-explicitly** afterwards; `up -d <service>` will silently reuse the old image.
+  **What matters is the diagnosis**, because the symptom is misleading: the
+  dashboard shows a hole that looks like message loss, while the broker lost
+  nothing. Stage 9's demonstrations use bursts, and stage 18 will ask where
+  messages went. Check `count(distinct ts_ms)` against `count(seq)` before
+  blaming the broker. Not scheduled for a fix — microsecond precision would
+  change the frozen payload contract and the firmware with it.
+- **`influx delete --predicate` removes the points but the tag value lingers**
+  in the series index until compaction, so `schema.tagValues` keeps listing a
+  deleted device. Query for actual points to confirm a deletion, not the tag list.
 
-**`compose.yaml` gains the `depends_on` wiring at stage 11**, not before.
-`influxdb` currently gates nothing, which is why its healthcheck was written as
-readiness rather than liveness.
+## Check first at stage 12
 
-**Four things already measured that constrain stage 11's design:**
+**Stage 12 is a provisioning stage, not a Python one.** Grafana, and a DBRP
+mapping exposing bucket `telemetry` under a v1-style database name so InfluxQL
+works. Nothing in `src/telemetry/` should need to change.
 
-- **A queue TTL does not touch unacknowledged messages** (stage 8) — a consumer
-  holding messages through a storage outage will not lose them to expiry, which
-  removes one failure mode from the design space.
-- **Shutdown takes `prefetch x callback duration`** (stage 8). With
-  `consumer_prefetch_count = 10` and compose's 10 s SIGTERM grace, any retry
-  loop slower than ~1 s per message cannot finish before SIGKILL. **Decide this
-  deliberately.**
-- **A blocking call in the pika callback stalls the I/O loop.** Three
-  consecutive 35 s sleeps did *not* trip a heartbeat disconnect, so the
-  threshold is above 35 s — but it is unmeasured, and `--ack-delay` can
-  reproduce the hazard on demand.
-- **Prefetch is the duplicate window.** An unclean crash redelivers 10.
-
-**Still open and now resolvable**, since an InfluxDB finally exists: whether
-`parse()`'s tolerance of a JSON integer for `temp_c` / `humidity_pct` survives
-InfluxDB's typed fields. See "Open questions".
+- **The measurement is `readings` and the only tag is `device`.** An InfluxQL
+  panel is `SELECT temp_c FROM readings WHERE device = 'sim-01'`, against a
+  database named by the DBRP mapping, which is *not* the same thing as the
+  measurement.
+- **Two devices are already publishing.** `sim-01` and `esp32c3-01` both carry
+  independent `seq` counters starting at 1. Any panel that does not group or
+  filter by `device` will interleave them.
+- **The Grafana image tag is still unverified**, and its healthcheck with it —
+  unknown whether `curl` or `wget` exists in that image. `curl` is confirmed
+  present in `influxdb:2.9`.
+- **`docker compose build` is only needed when `pyproject.toml` changes.** Stage
+  12 adds a container, so it should not need one — but `up -d <service>` silently
+  reuses an old image, so check if anything Python does change.
 
 ## Open questions
+
+**All stage 11 questions are answered**, and the five live choices were decided
+in conversation rather than unilaterally: the schema (measurement name, and
+`seq` as a field), whether the write blocks the callback, the storage-failure
+policy, duplicate handling, and the time budget. Each is recorded with its
+reasoning in "Storage writes (stage 11)" above.
+
+**Three stage 11 details were decided without consultation** and are flagged as
+such, following stage 9's precedent:
+
+- **The `INFLUXDB_*` config fields carry defaults rather than being required.**
+  Forced by a recorded stage 10 decision — a required field would stop three
+  modules that never touch storage from starting at all.
+- **The shutdown flag moved to module scope in `amqp.py`.** A handler needs to
+  see it and is built before `run_consumer()` is called. `consumer_observe`
+  shares the module and is unaffected.
+- **`EXIT_UNCONFIGURED = 5`**, following `topology.py`'s `EXIT_MISMATCH = 4`.
+
+**Stage 11 closed three things that had been carried as unknown:** whether
+`parse()`'s integer tolerance survives InfluxDB's typed fields (it does not —
+HTTP 422, so `to_point()` coerces), where the heartbeat threshold sits relative
+to a blocking write (explicit at 60 s now, and 4.5 minutes of 7.5 s stalls did
+not trouble it), and whether a redelivery needs deduplicating (it does not —
+three writes of one identity give one point).
 
 **All stage 10 questions are answered**, and all four were decided in
 conversation rather than unilaterally: the org/bucket/prefix naming, the
@@ -1281,12 +1506,9 @@ where the contract lives, how strict the type check is. None is open.
 
 **Raised at stage 6, deliberately not acted on:**
 
-- **Heartbeat interval is left at pika's negotiated default.** Nothing sets it
-  explicitly, which is a gap against the explicit-over-inherited rule. Recorded,
-  not fixed — stage 11 is where a blocking call in the callback stops being
-  hypothetical. **Stage 8 narrowed the risk**: three consecutive 35 s blocking
-  sleeps inside the callback did not trip a disconnect, so the threshold is
-  above 35 s. Where exactly is still unmeasured.
+- **Heartbeat interval — CLOSED at stage 11.** Now explicit at
+  `HEARTBEAT_SECONDS = 60` in `amqp.connect()`. Kept here only to record that
+  the gap existed from stage 6 to stage 11.
 - **`run_consumer()` takes no "drain and exit" mode.** Not needed by any stage
   so far; noted because stage 18 might want one.
 
@@ -1296,15 +1518,16 @@ where the contract lives, how strict the type check is. None is open.
   uses a clean session, and whether persistent-session behaviour is reachable, is
   undecided. Harmless for stage 6. It is the mechanism behind the stage 18
   duplicate demonstration, so **do not let it disappear.**
-- **Stage 11's storage-failure policy** — retry with backoff vs dead-letter after
-  N attempts. Left to the user during implementation.
-- **Whether `parse()`'s number tolerance survives InfluxDB's typed fields.**
-  `parse()` accepts a JSON integer for `temp_c` / `humidity_pct`; InfluxDB
-  fields are typed and a float field is expected to reject a later integer.
-  **Still not verified, but now testable** — stage 10 gave the project a live
-  InfluxDB. Resolve it at stage 11, most likely by coercing with `float()` at
-  the write, which keeps the tolerance a dead-lettering decision rather than a
-  storage one.
+- **Millisecond timestamps are not enough for a tight burst** — 200 messages in
+  7 ms collapse to 7 points. Recorded under "Environment facts"; **not
+  scheduled**, because microsecond precision would change the frozen payload
+  contract and the firmware with it. It is a diagnosis to remember, not a bug to
+  fix.
+- **A permanent write failure retries and requeues forever.** A 401 or a 422 is
+  treated exactly like an outage. Deliberate — the uniform path is simpler and
+  the backoff paces it — but nothing ever escalates. Bounded retry with a
+  classification of permanent-vs-transient is the hook if it is ever wanted, and
+  it belongs nowhere in the current plan.
 - **Grafana image tag** — unverified, and its healthcheck with it: unknown
   whether `curl` or `wget` exists in that image. Matters at stage 12. InfluxDB's
   is now settled at `influxdb:2.9`, alongside `rabbitmq:4.3-management`, and
