@@ -8,7 +8,7 @@ guarantees; a durable path stores them, an observation path is lossy by design.
 between "gets the pipeline working faster" and "makes broker behaviour visible",
 choose the second. This is not a project optimising for shipping speed.
 
-## Current state — two independent tracks
+## Current state — two tracks, no longer independent
 
 The plan has a software half (stages 1–13) and a hardware half (14–18). They run
 in parallel and meet only at the payload contract. **There is no single "current
@@ -16,7 +16,7 @@ stage"; a scalar marker cannot describe two tracks.**
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 11** — `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
+| **Software** | **Stage 12** — Grafana reads the pipeline back. Its datasource is provisioned from `grafana/provisioning/`, and a one-shot `dbrp` service declares the InfluxQL database. Underneath: `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
 | **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
 
 **The two tracks have now met, and the parallelism ends here.** Hardware is done
@@ -24,11 +24,18 @@ through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
 *both* halves, so it cannot start until software reaches stage 13. There is no
 independent hardware work left to schedule.
 
-Next: **stage 12** on the software track — Grafana, provisioned from
-version-controlled configuration, plus the DBRP mapping that exposes the bucket
-under a v1-style database name so InfluxQL works. Then 13. Stage 17's own DoD
+Next: **stage 13** on the software track — temperature and humidity panels on a
+short time range with a fast refresh, provisioned as a dashboard file rather
+than saved from the UI, since Grafana has no state volume. Stage 17's own DoD
 gets its second half signed off when stage 13 lands — the MCU side is already
-proven and needs no rework for it.
+proven and needs no rework for it. Stage 18 then needs both halves.
+
+**The DBRP mapping did not have to be created.** InfluxDB 2.x synthesises a
+read-only virtual one for any bucket without an explicit mapping, and InfluxQL
+worked through it before stage 12 wrote anything — verified against the running
+instance. It is declared explicitly anyway, on the "explicit over inherited"
+rule. The plan's stage 12 text reads as though creating it were forced; it was
+not.
 
 **The ESP32 is already writing to InfluxDB.** It was powered on during stage 11
 verification, and `esp32c3-01` appears alongside `sim-01` as a second series with
@@ -50,7 +57,10 @@ of stages not yet planned.**
 | `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP and storage plumbing, config — see `src/telemetry/CLAUDE.md` |
 | `firmware/` | ESP-IDF project for the ESP32-C3 — see `firmware/CLAUDE.md` |
 | `tests/` | pytest, **no broker and no database required** — keep it that way |
-| `compose.yaml` | RabbitMQ, InfluxDB, publisher, consumers |
+| `rabbitmq/` | broker config and enabled plugins; an unknown key aborts startup |
+| `grafana/provisioning/` | datasource (stage 12) and dashboard (stage 13), read-mounted; Grafana keeps no state of its own |
+| `influxdb/dbrp.sh` | one-shot declarer for the InfluxQL database mapping |
+| `compose.yaml` | RabbitMQ, InfluxDB, Grafana, publisher, consumers, two one-shot declarers |
 | `mcu-rabbitmq-staged-plan.md` | The 18-stage plan, with per-stage Definitions of Done |
 
 ## These CLAUDE.md files are the decision record
@@ -111,7 +121,11 @@ belonging to a later stage get recorded, not implemented.
 - Topology lives in `topology_spec.py`, separate from the code that declares it.
 - `seq=<int>` appears as a bare token in every log line about a message, so
   `grep -o 'seq=[0-9]*'` works as a comparison tool.
-- Exit codes: `0` clean, `2` broker unreachable, `3` auth rejected.
+- Exit codes: `0` clean, `2` broker unreachable, `3` auth rejected — shared in
+  `amqp.py`. Two are owned by the one module each means something to: `4`
+  topology mismatch (`topology.py`), `5` storage unconfigured
+  (`consumer_store.py`, an empty `INFLUXDB_TOKEN`). Note `3` is the *broker*
+  refusing supplied credentials, which `5` is not.
 - Tests must pass with no broker running.
 
 ## Environment facts
