@@ -28,10 +28,15 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet** — the software track is at stage 10, so there are consumers and
-an InfluxDB now, but nothing writes to it (stage 11) and there is no Grafana
-(stage 12) and no dashboard (stage 13). Sign that half off when the software
-track reaches stage 13; do not quietly redefine it.
+reachable yet**, but it is closer than it was. The software track is at stage 11,
+so **this board's readings are now stored in InfluxDB** — `esp32c3-01` is a live
+series alongside `sim-01`, with its own independent `seq`. What is still missing
+is Grafana (stage 12) and the dashboard itself (stage 13). Sign that half off
+when the software track reaches stage 13; do not quietly redefine it.
+
+**Nothing in the firmware had to change for the storage write to work.** The
+payload contract held exactly as frozen at stage 5, which is what building the
+software half against a simulator first was for.
 
 Stage 6 confirmed one half of the contract end to end: the MCU's messages are
 consumed off both queues, parsed, and logged with matching `seq` on both paths,
@@ -764,12 +769,16 @@ must satisfy it exactly; not open to renegotiation. The contract lives in
   conversion is needed. Note the driver's argument order is **humidity first**,
   the opposite of this field order. Both must be finite.
 
-  **Keep emitting floats.** The consumer tolerates a bare `29` rather than
-  `29.0` so that a format-string change cannot silently dead-letter good
-  readings, but that is a safety net, not permission to change what the firmware
-  sends — and it may not survive stage 11, where InfluxDB's typed fields could
-  reject an integer written to a field already created as a float. Unverified
-  until then.
+  **Keep emitting floats, and stage 11 turned the reason into a measured one.**
+  The consumer tolerates a bare `29` rather than `29.0` so that a format-string
+  change cannot silently dead-letter good readings — a safety net, not
+  permission to change what the firmware sends. **Verified at stage 11**:
+  InfluxDB rejects an integer written to a field already created as a float with
+  **HTTP 422**. The consumer's `storage.to_point()` now coerces with `float()`,
+  so an integer would in fact survive — but that coercion exists to keep the
+  tolerance a dead-lettering decision, not to license integers on the wire. A
+  DHT11 yields whole numbers (`24.0`, never `24.4`), so the formatting is the
+  only thing standing between this and the trap.
 - `ts_ms` — epoch **milliseconds**, publisher-stamped; needs SNTP, implemented at
   stage 17 in `time_sync.c`
 - MQTT topic `sensors/esp32c3/telemetry`, **QoS 1**, protocol version **5.0**

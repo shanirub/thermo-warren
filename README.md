@@ -7,7 +7,7 @@ bindings, acknowledgment, dead-lettering. The staged plan is the working documen
 
 | Track | Stage | Status |
 | --- | --- | --- |
-| Software | 10 | InfluxDB up and provisioned at first start — org, bucket and admin token. Nothing writes to it yet; that is stage 11 |
+| Software | 11 | `consumer_store` writes each reading to InfluxDB between the parse and the ack. A failed write retries three times and then requeues — it never dead-letters |
 | Hardware | 17 | MQTT 5 publisher, SNTP, outage policy and OLED link icon, all verified on hardware — the MCU now feeds both queues |
 
 The two tracks ran in parallel and met at the payload contract. Hardware work
@@ -16,9 +16,11 @@ steps, including the two one-time steps a new board needs before it will join th
 network.
 
 **That meeting has happened:** the MCU publishes to both queues and its payload
-matches the contract exactly. What remains for stage 17's Definition of Done — a
-dashboard showing real room temperature — is blocked on the software track, which
-has to reach stage 13 first. Stage 18 needs both halves and so is the point where
+matches the contract exactly, and from stage 11 its readings are **stored** —
+`esp32c3-01` is a live series in InfluxDB alongside the simulator's `sim-01`,
+with no firmware change required. What remains for stage 17's Definition of
+Done — a dashboard showing real room temperature — is blocked on the software
+track, which has to reach stage 13 first. Stage 18 needs both halves and so is the point where
 the tracks stop being independent.
 
 ## Setup
@@ -60,11 +62,196 @@ Configuration precedence is: process environment → `.env` → field default.
 Compose loads `.env` wholesale and then overrides the hostnames per service,
 so `.env` holds only the host-mode values.
 
+From stage 11 that applies to `INFLUXDB_URL` as well as `RABBITMQ_HOST`, and
+`consumer_store` is the one module that needs a real `INFLUXDB_TOKEN` — it exits
+**5** with a message naming the variable if it is empty. The other three modules
+start without one, deliberately, because they never touch storage.
+
+## Stage 11 verification
+
+The durable consumer writes to InfluxDB **between the parse and the
+acknowledgment**. That ordering is the whole stage: acknowledging first loses the
+message if the process dies in between, acknowledging after redelivers it, which
+is what makes the pipeline at-least-once end to end.
+
+The stage's real content is the failure test, not the happy path.
+
+### The schema
+
+One measurement, one tag, three fields.
+
+```
+readings,device=sim-01 temp_c=24.4,humidity_pct=62.5,seq=1234i 1756400000123
+```
+
+`seq` is a **field, not a tag**, deliberately. Tag values are indexed and every
+distinct tag set is a series; `seq` is monotonic and unbounded, so tagging it
+would create one series per message — about 86,400 a day at 1 Hz — against a
+bucket whose retention is infinite. `device` is the only tag, which is what keeps
+the simulator and the MCU in separate series with independent `seq` counters.
+
+### The Definition of Done
+
+```bash
+docker compose build            # pyproject.toml changed -- `up -d` will NOT do this
+docker compose up -d --wait
+
+docker compose logs consumer-store --tail 5      # "stored: seq=N"
+
+docker compose exec influxdb influx query '
+from(bucket: "telemetry") |> range(start: -2m)
+  |> filter(fn: (r) => r._measurement == "readings")
+  |> last()'
+```
+
+Check the `_time` column reads as **now, to the millisecond**. If every point
+landed in January 1970, the write precision was left at the library default —
+see below.
+
+Then compare what the consumer says it stored against what is actually stored:
+
+```bash
+docker compose logs consumer-store --since 150s | grep -oE 'stored: seq=[0-9]+'
+```
+
+Measured over a 150 s window: 119 logged, 119 stored, sets identical, no gaps.
+
+### The failure test — stop the storage container
+
+```bash
+docker compose stop influxdb
+# watch for ~45s, then:
+docker compose exec rabbitmq rabbitmqctl list_queues \
+  name messages_ready messages_unacknowledged
+```
+
+Expected, and measured:
+
+| Queue | State during the outage |
+| --- | --- |
+| `telemetry.store` | ready climbing (486 at the sample), unacked pinned at **10** |
+| `telemetry.dlq` | **0** — nothing is dead-lettered |
+| `telemetry.observe` | **unaffected**, still draining |
+
+That last row is the practical payoff of the fan-out: the fragile path is
+isolated from the observation path.
+
+The consumer log shows three attempts at 0.5 / 1 / 2 s, then a requeue:
+
+```
+WARNING storage write failed (attempt 1 of 3) for seq=143: NameResolutionError: ...
+WARNING storage write failed (attempt 2 of 3) for seq=143: NameResolutionError: ...
+WARNING storage write failed (attempt 3 of 3) for seq=143: NameResolutionError: ...
+ERROR   storage unavailable, requeueing: seq=143 delivery_tag=181
+```
+
+**Requeue, never dead-letter.** `telemetry.dlq` means one thing — this message
+failed the payload contract — and a good reading that happened to arrive during
+an outage is not poison. `x-death` records the *broker's* reason and has no room
+for ours, so the two would be indistinguishable once mixed.
+
+The final 2 s sleep, after the *last* failed attempt, is what paces the requeue.
+Without it the message returns immediately and a storage outage becomes the same
+hot redelivery loop `--requeue-poison` exists to demonstrate.
+
+### Restart, and confirm nothing was lost
+
+```bash
+docker compose start influxdb
+```
+
+Queues drain to zero, `telemetry.dlq` is still empty, and a per-device gap
+analysis comes back clean — zero gaps and zero duplicate `seq`, for both
+`sim-01` and `esp32c3-01`. You should also see exactly **ten** lines like:
+
+```
+WARNING redelivered, point overwritten in place: seq=1436
+```
+
+Ten, because `consumer_prefetch_count` is 10 — this is stage 6's "prefetch is
+the duplicate window" made visible. The points were overwritten in place rather
+than duplicated, because point identity is measurement + tag set + timestamp and
+all three are unchanged. **Verified separately**: three writes of one identity
+produce one point.
+
+### The other outage shape — pause instead of stop
+
+```bash
+docker pause thermo-warren-influxdb-1
+```
+
+`stop` closes the listener, so writes fail in microseconds and the timeout never
+comes into play. `pause` leaves the socket open and answering nothing, which is
+the only case that exercises it:
+
+```
+WARNING storage write failed (attempt 1 of 3) for seq=1195: ReadTimeoutError:
+        HTTPConnectionPool(host='influxdb', port=8086): Read timed out.
+        (read timeout=1.999392556026578)
+```
+
+Two s per attempt, ~7.5 s per cycle. Run it for several minutes and confirm **no
+heartbeat disconnect** — measured at 4.5 minutes of continuous stalls with zero
+connection losses, cancels or reconnects. That is what the explicit
+`heartbeat=60` in `amqp.connect()` was added to make sizeable.
+
+### Shutdown during an outage
+
+```bash
+docker pause thermo-warren-influxdb-1
+time docker compose stop consumer-store
+docker inspect -f '{{.State.ExitCode}}' thermo-warren-consumer-store-1
+```
+
+Expect **~1 s and exit 0**. If you see 10 s and exit 137, the handler is not
+abandoning its work on SIGTERM.
+
+This needed two fixes, and the first was not enough. An interruptible backoff is
+the obvious one — but pika still drains its prefetched deliveries through the
+callback, and each one paid a full 2 s write timeout *before* the handler could
+notice the shutdown. Ten of those against a 10 s grace is a SIGKILL. The second
+fix skips the write attempt entirely once storage is already known bad.
+
+Deliberately conditional on that, rather than on "are we stopping": a **normal**
+shutdown still writes and acks its prefetched batch, or every restart would
+return ten perfectly writable messages to ready and print ten `redelivered`
+warnings that mean nothing.
+
+### Two traps worth knowing
+
+**`write_precision` defaults to `'ns'`, and the `Point`'s own precision does not
+rewrite the number.** An int timestamp is serialized verbatim, so the only thing
+that gives `1756400000123` meaning is the query parameter `write()` sends. Left
+at the default, every point lands in January 1970 and nothing reports an error.
+
+**A tight burst collapses in storage, and the broker is blameless.**
+
+```bash
+DEVICE_ID=burst-probe MQTT_CLIENT_ID=burst-probe \
+  python -m telemetry.publisher --burst 200
+```
+
+200 messages published in **7 milliseconds**; all 200 delivered, consumed and
+written; **7 points** survive — one per distinct millisecond, each holding the
+last `seq` written in that millisecond. The queues drain, the DLQ stays empty,
+and nothing is lost in the pipeline. The dashboard simply shows a hole that looks
+like message loss and is not. At the 1 Hz steady state the margin is 1000x, so
+this is a diagnosis to remember rather than a bug to fix — microsecond precision
+would change the frozen payload contract and the firmware with it.
+
+Check `count(distinct ts_ms)` against `count(seq)` before blaming the broker.
+
+### Tests
+
+```bash
+pytest          # 114 passed, with no broker and no InfluxDB running
+```
+
 ## Stage 10 verification
 
 Storage. The first stage in six that adds a container rather than changing queue
-arguments — no `--recreate`, no 406, no dead-lettering. Nothing writes to
-InfluxDB yet; `consumer_store` gains that at stage 11.
+arguments — no `--recreate`, no 406, no dead-lettering. Nothing wrote to
+InfluxDB at this stage; `consumer_store` gained that at stage 11.
 
 ### The Definition of Done
 
@@ -95,8 +282,8 @@ docker compose exec influxdb influx query \
 
 Two things about that snippet are deliberate.
 
-**The measurement is `stage10_check`, not the telemetry measurement stage 11
-will choose.** Retention is infinite, so this point is permanent; a throwaway
+**The measurement is `stage10_check`, not `readings` — the telemetry measurement
+stage 11 chose.** Retention is infinite, so this point is permanent; a throwaway
 name keeps it from ever being mistaken for real data. `influx delete
 --predicate` removes it if you want it gone.
 
@@ -139,6 +326,9 @@ code in the OSS API spec and cannot express "not ready" at all.
 
 Unlike the broker's check, this one is *readiness*: `curl` proves the HTTP API
 answers, not merely that a socket accepts. Stage 11 gates `consumer-store` on it.
+(One consequence: right after a `docker unpause`, the gate refuses to start
+`consumer-store` until the healthcheck recovers, reporting `dependency failed to
+start: container ... is unhealthy`. Wait for health rather than retrying.)
 The `start_period` covers a two-phase startup rather than a slow boot — on first
 start the entrypoint runs a temporary `influxd` on port 9999, sets up against
 it, kills it, and only then binds 8086.
