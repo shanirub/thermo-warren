@@ -7,7 +7,7 @@ MQTT via `paho-mqtt`.
 Read the repo-root `CLAUDE.md` too — the working-style rules there apply here,
 including the obligation to update this file at the end of every stage.
 
-**Software track state: stage 11 done and verified.** Next is stage 12.
+**Software track state: stage 12 done and verified.** Next is stage 13.
 
 Both consumers are real, and `consumer_store` dead-letters anything that fails
 the payload contract. **All three dead-letter triggers are now demonstrated** —
@@ -19,7 +19,11 @@ again. Shared AMQP plumbing lives in `amqp.py`; the payload contract lives in
 
 **`consumer_store` now writes to InfluxDB between the parse and the ack**, and
 the pipeline is at-least-once end to end. Storage plumbing lives in
-`storage.py`; Grafana gets the read at stage 12.
+`storage.py`.
+
+**Grafana reads it back from stage 12**, with its datasource provisioned from
+`grafana/provisioning/` and the InfluxQL database declared by a one-shot `dbrp`
+service. **No Python was involved**, and none should be at stage 13 either.
 
 ## Architecture decisions (settled — do not re-open)
 
@@ -48,8 +52,10 @@ the pipeline is at-least-once end to end. Storage plumbing lives in
 - **`influxdb:2.9`** (stage 10), not 1.8 and not 3 Core. Floating across patch
   releases exactly like `rabbitmq:4.3-management`. **InfluxQL, not Flux**,
   through a DBRP mapping — InfluxQL survives a future move to 3 Core, Flux does
-  not. The mapping itself is stage 12's, so stage 10's hand checks are
-  necessarily Flux; that is staging, not a reversal.
+  not. The explicit mapping is stage 12's; stage 10's hand checks were written
+  in Flux for that reason. **That reason turned out not to hold** — 2.x
+  synthesises a virtual mapping, so InfluxQL would have worked at stage 10 too.
+  The Flux checks are staging, not a reversal, but they were not forced.
 
 ## Where things live
 
@@ -102,6 +108,14 @@ which is meaningless for a consumer.
   Three files, three categories, and the split is the point: an endpoint, a
   queue argument and a field name fail in three different ways. `payload.py`
   joined the list at stage 7.
+
+**Stage 12's two files hold no Python and do not join that list.** The database
+name is not a literal in either of them — `influxdb/dbrp.sh` and the datasource
+file both take it from `${INFLUXDB_BUCKET}`, so bucket and database cannot drift
+apart. What *is* literal there is the retention policy `autogen` and the
+datasource uid `influxdb-telemetry`, and both are deliberate: `autogen` matches
+the name InfluxDB gives the virtual mapping it replaces, and the uid is pinned
+because stage 13's dashboard references it.
 
 ## Topology
 
@@ -1030,6 +1044,143 @@ failure — wait for health rather than retrying the command.
 | Recovery | Queues drain to 0, exactly 10 `redelivered` warnings, DLQ still 0 |
 | Tests with nothing running | **114/114**, no broker and no InfluxDB |
 
+## Visualization (stage 12, implemented and verified)
+
+Grafana, plus the DBRP mapping that exposes the bucket to InfluxQL. **No Python,
+no new dependency, no rebuild** — two compose services, one shell script and one
+provisioning file.
+
+| Thing | Value |
+|---|---|
+| Image | `grafana/grafana:13.2` (patch `13.2.2` at the time of writing, Alpine base, runs as uid 472) |
+| Published port | `127.0.0.1:3000` |
+| Datasource uid | `influxdb-telemetry` — pinned, because stage 13's dashboard references it |
+| InfluxQL database | `telemetry` (= the bucket name), retention policy `autogen` |
+| State volume | **none**, deliberately |
+| Files | `grafana/provisioning/datasources/influxdb.yaml`, `influxdb/dbrp.sh` |
+
+### The DBRP mapping did not have to be created
+
+**InfluxDB 2.x synthesises a read-only *virtual* DBRP mapping for any bucket that
+has no explicit one**, using the bucket name as the database and `autogen` as the
+retention policy. Verified before anything was written: `influx v1 dbrp list`
+showed `telemetry` under `VIRTUAL DBRP MAPPINGS (READ-ONLY)`, and
+`GET /query?db=telemetry&q=SELECT ... FROM readings` already returned HTTP 200
+with rows. **The plan's stage 12 text is wrong on this point** — see "Correction
+to the staged plan" below.
+
+It is declared explicitly anyway, on the standing "explicit over inherited"
+rule: the repo should state that the database exists rather than depend on a 2.x
+convenience that InfluxDB 3 will not carry.
+
+**Verified both ways:** creating the explicit mapping makes the virtual one
+disappear from the listing, and deleting the explicit one brings it straight
+back. Explicit shadows virtual; the two never coexist for one bucket.
+
+### `influxdb/dbrp.sh` — and the grep that is the whole trick
+
+A one-shot service on the `influxdb:2.9` image (the CLI ships inside the server
+image, so nothing extra is pulled), the same shape as `topology`: runs to
+completion, exits, and `grafana` gates on `service_completed_successfully`.
+
+Compose re-runs it on every `up`, so it must be idempotent, and the naive check
+is a trap:
+
+- **`influx v1 dbrp list --json` INCLUDES virtual mappings**, each carrying
+  `"virtual": true`; an explicit one carries `"virtual": false`. Matching on the
+  database name alone would always find the virtual mapping and therefore never
+  create anything. The check greps for `"virtual": false`.
+- **`influx v1 dbrp create` takes `--bucket-id`, not a bucket name**, so the id
+  is looked up first with `influx bucket list --name ... --hide-headers | cut -f1`.
+  That nested command substitution is why this is a script file rather than an
+  inline compose `command:` — inline it would also need compose's `$$` escaping.
+- **`jq` is not in the image** (Debian 12 base). `grep`, `sh`, `bash` and `curl` are.
+- **`--rp autogen` deliberately reuses the virtual mapping's retention-policy
+  name**, so any query written against the virtual mapping keeps working.
+  `--default` is what lets a query name the database bare instead of
+  `"telemetry"."autogen"`.
+
+**`INFLUX_HOST` / `INFLUX_ORG` / `INFLUX_TOKEN` appear in this service's
+`environment:` and nowhere else.** That is the single deliberate exception to
+stage 10's rule that `INFLUX_`-prefixed names stay out of `.env` — the rule
+exists so no service is configured silently by inheriting `env_file`, and this
+is the one service that actually wants them, so it maps them by hand from the
+`INFLUXDB_` keys and takes no `env_file` at all.
+
+### The datasource: a token header, not user/password
+
+Checked against Grafana's current documentation rather than memory. For InfluxDB
+**2.x with InfluxQL** the provisioned shape is `jsonData.dbName` plus a custom
+`Authorization` header — **not** the `user`/`password` pair a 1.x server takes,
+and not the `token` field the Flux shape uses:
+
+```yaml
+jsonData:      { version: InfluxQL, dbName: $INFLUXDB_BUCKET,
+                 httpMode: GET, httpHeaderName1: Authorization }
+secureJsonData:{ httpHeaderValue1: Token $INFLUXDB_TOKEN }
+```
+
+- **`dbName` is the DBRP database, not the measurement.** The measurement is
+  `readings` and belongs in a query's `FROM`. Stage 11 chose two different words
+  precisely so this never reads as `FROM telemetry` in database `telemetry`.
+- **`$VAR` lookup works in provisioning files, including inside
+  `secureJsonData`**, so the token stays in `.env` and never enters the repo.
+  Grafana treats any text after a `$` as a variable name and would corrupt a
+  value containing one — `INFLUXDB_TOKEN` is hex rather than base64, a stage 10
+  decision taken for `.env` quoting, which pays off a second time here.
+- **`access: proxy`.** Grafana's backend makes the query, so the browser never
+  talks to InfluxDB and 8086 can stay on loopback. `direct` would require
+  exposing 8086 to the LAN and would hand the token to every browser that loads
+  a dashboard.
+- **A provisioned datasource comes back `"readOnly": true` from the API** and
+  cannot be edited in the UI. Correct, and worth knowing before stage 13: the
+  dashboard references it, it is not adjusted by hand.
+
+### No state volume, deliberately
+
+Grafana keeps users, preferences and UI-created dashboards in
+`/var/lib/grafana/grafana.db`. It is left in the container's writable layer.
+
+**The stage's own verification is the reason.** The DoD asks for a teardown that
+proves provisioning rather than a stale volume — and with a named volume, a
+datasource surviving `docker compose down` would prove nothing, because the
+provisioner writes into a database that persisted. With no volume every boot
+starts empty, so a datasource that is present afterwards can only have come from
+the file. Distinguishing the two otherwise would need `down -v`, which is
+all-or-nothing and would destroy the readings the dashboard exists to render.
+
+Cost, accepted: **UI panel edits and Explore history are scratch and do not
+survive `down`** (they do survive `stop`/`restart`). Stage 13 provisions the
+dashboard from a file anyway. Confirmed after a `down`: three volumes, none of
+them Grafana's.
+
+### Healthcheck, and a lag worth knowing
+
+`curl -sf http://localhost:3000/api/health` — no authentication needed, so it
+cannot log a 401 every interval forever, the same reasoning as `influxdb`'s
+`/health`. **Both `curl` and `wget` are present in the image**, checked before
+the line was written; `curl` was chosen to match `influxdb`'s check exactly.
+
+**The container's health status lags real readiness.** Measured across a
+`restart`: the HTTP port is closed for ~2 s (curl exits 000, and a `curl -s` into
+a JSON parser fails on an empty body rather than on anything meaningful), the
+datasource answers `"status":"OK"` at ~3 s, and Docker still reports `starting`
+until ~6 s, because `start_period: 15s` and `interval: 10s` delay the first
+probe. Conservative, not wrong — but poll the endpoint, don't race it.
+
+### Stage 12 DoD — verified against real behaviour
+
+| Check | Result |
+|---|---|
+| `grafana` starts with the datasource already present | `GET /api/datasources` → 1 entry, uid `influxdb-telemetry`, `dbName` substituted to `telemetry` |
+| Connection test passes | `GET /api/datasources/uid/influxdb-telemetry/health` → `"status":"OK"`, *"2 measurements found"* (`readings` + the permanent `stage10_check` point) |
+| A bare query returns rows | `POST /api/ds/query`, InfluxQL through Grafana's proxy → three frames (`readings.temp_c`, `.humidity_pct`, `.seq`) |
+| Both devices reachable | `count(seq)` grouped by `device` over 24 h: `sim-01` 13187, `esp32c3-01` 12848 |
+| Teardown, **no `-v`**, then up | Datasource and health both still OK; `docker volume ls` shows **three** volumes, none Grafana's |
+| `dbrp` idempotent across re-runs | Second `up`: *"already present"*, and exactly **1** explicit mapping, not two |
+| Explicit mapping exists | `influx v1 dbrp list` → one row, `VIRTUAL` section now empty |
+| Tests with nothing changed | **114/114** |
+
 ## Logging, errors, testing
 
 - **Shared `logging_setup.py`**, console only. No file handlers, no
@@ -1094,10 +1245,11 @@ failure — wait for health rather than retrying the command.
 - **AMQP, management and InfluxDB bound to 127.0.0.1; MQTT is not.** 1883
   publishes on `0.0.0.0` from stage 17, because the ESP32 reaches it over the
   LAN and no narrower binding works. **8086 stays on loopback** — nothing off
-  this host talks to InfluxDB, since Grafana reaches it over the compose network
-  at stage 12 and the published port exists only for host mode and hand checks. This exposes the `iot` user, which still carries the
-  `administrator` tag — the answer to that is the scoped application user in
-  "Open questions", not a bind address.
+  this host talks to InfluxDB: Grafana reaches it over the compose network with
+  `access: proxy`, and the published port exists only for host mode and hand
+  checks. **3000 is on loopback too**, from stage 12. Exposing 1883 exposes the
+  `iot` user, which still carries the `administrator` tag — the answer to that
+  is the scoped application user in "Open questions", not a bind address.
 - **`anonymous_login_user = none`** in `rabbitmq.conf`. `mqtt.allow_anonymous`
   was deliberately omitted — an unsupported key aborts boot, and the docs are
   ambiguous about whether it survives in 4.3.
@@ -1108,6 +1260,14 @@ failure — wait for health rather than retrying the command.
   socket — liveness, not correctness.
 - `topology` stays one-shot permanently. `publisher` is long-lived
   (`restart: unless-stopped`) from stage 5.
+- **`dbrp` is the second permanent one-shot**, added at stage 12. From here the
+  steady state has **two** `Exited (0)` services, not one. It gates `grafana` on
+  `service_completed_successfully`, the same enforcement idiom as stage 4's gate
+  — and not merely for ordering, since the datasource's own health check issues
+  a query against the v1 endpoint.
+- **`grafana` binds 127.0.0.1:3000 and has no state volume.** It takes no
+  `env_file`: the four keys it needs are passed by hand, so the broker
+  credentials never enter its environment.
 - **`influxdb` gates `consumer-store`** from stage 11
   (`condition: service_healthy`), which is what its readiness-style healthcheck
   was written for at stage 10. Not load-bearing — the write retry and requeue
@@ -1133,12 +1293,16 @@ re-applied, since both sets apply solely on first boot against an empty data
 directory. Note `-v` is all-or-nothing across services — there is no "reset only
 InfluxDB" short of `docker volume rm` by name.
 
-**Expected steady state from stage 10:** `rabbitmq` Up (healthy), `influxdb`
+**Expected steady state from stage 12:** `rabbitmq`, `influxdb` and `grafana` all
 Up (healthy), and `publisher`, `consumer-observe` and `consumer-store` all Up.
-**Only `topology` is `Exited (0)`** — the one-shot declarer having done its job,
-which is what the other three gate on. Both queues sit near `ready=0` with
-`consumers=1` each. Management UI at `http://localhost:15672`; InfluxDB UI at
-`http://localhost:8086`, logging in with `INFLUXDB_USERNAME`/`_PASSWORD`.
+**`topology` and `dbrp` are both `Exited (0)`** — the two one-shot declarers
+having done their jobs, which is what everything else gates on. Both queues sit
+near `ready=0` with `consumers=1` each. Management UI at
+`http://localhost:15672`; InfluxDB UI at `http://localhost:8086`, logging in with
+`INFLUXDB_USERNAME`/`_PASSWORD`; Grafana at `http://localhost:3000` with
+`GRAFANA_USERNAME`/`_PASSWORD`.
+
+Note `down -v` still destroys **three** volumes, not four: Grafana has none.
 
 ## Verified broker facts — do not re-search
 
@@ -1278,6 +1442,14 @@ which is what the other three gate on. Both queues sit near `ready=0` with
   be supported from the start.
 
 ## Correction to the staged plan
+
+Stage 12's text says InfluxDB 2.x "needs a mapping exposing the bucket under a
+v1-style database name". The mapping is needed; **it does not have to be
+created**. 2.x synthesises a read-only virtual DBRP for any bucket without an
+explicit one, and InfluxQL worked through it before a line was written — checked
+against the running instance, not assumed. Declaring one explicitly is a choice
+taken on the "explicit over inherited" rule, and the plan reads as though it were
+forced. See "Visualization (stage 12)" above.
 
 Stage 5's definition of done in `mcu-rabbitmq-staged-plan.md` says both queue
 depths climb **in lockstep**. **That is wrong.** `telemetry.observe` carries
@@ -1421,27 +1593,47 @@ once, at stage 6, before the non-atomic `purge_queue` behaviour was understood.
   in the series index until compaction, so `schema.tagValues` keeps listing a
   deleted device. Query for actual points to confirm a deletion, not the tag list.
 
-## Check first at stage 12
+## Check first at stage 13
 
-**Stage 12 is a provisioning stage, not a Python one.** Grafana, and a DBRP
-mapping exposing bucket `telemetry` under a v1-style database name so InfluxQL
-works. Nothing in `src/telemetry/` should need to change.
+**Stage 13 is a provisioning stage too**, and like stage 12 it should need no
+Python: temperature and humidity panels on a short time range with a fast
+refresh, provisioned as a dashboard file under `grafana/provisioning/dashboards/`
+rather than saved from the UI. Grafana has no state volume, so a dashboard built
+by clicking would be lost on the next `down`.
 
-- **The measurement is `readings` and the only tag is `device`.** An InfluxQL
-  panel is `SELECT temp_c FROM readings WHERE device = 'sim-01'`, against a
-  database named by the DBRP mapping, which is *not* the same thing as the
-  measurement.
-- **Two devices are already publishing.** `sim-01` and `esp32c3-01` both carry
-  independent `seq` counters starting at 1. Any panel that does not group or
-  filter by `device` will interleave them.
-- **The Grafana image tag is still unverified**, and its healthcheck with it —
-  unknown whether `curl` or `wget` exists in that image. `curl` is confirmed
-  present in `influxdb:2.9`.
+- **The measurement is `readings` and the only tag is `device`.** A panel is
+  `SELECT temp_c FROM readings WHERE device = 'sim-01'`, against database
+  `telemetry`, which is the DBRP database and *not* the measurement.
+- **Reference the datasource by uid `influxdb-telemetry`.** It is pinned for
+  exactly this, and a provisioned datasource is `readOnly` — the dashboard
+  points at it, it is not adjusted by hand.
+- **Two devices are publishing.** `sim-01` and `esp32c3-01` carry independent
+  `seq` counters starting at 1. Any panel that does not group or filter by
+  `device` interleaves them.
+- **The `device` tag index also holds three stage 11 test values** —
+  `burst-probe`, `int-probe` and `overwrite-probe` — with no recent points. A
+  template variable built from `SHOW TAG VALUES FROM readings WITH KEY = device`
+  will list five devices, three of them artefacts. Either filter them or accept
+  them knowingly; they are permanent, because retention is infinite.
 - **`docker compose build` is only needed when `pyproject.toml` changes.** Stage
-  12 adds a container, so it should not need one — but `up -d <service>` silently
-  reuses an old image, so check if anything Python does change.
+  12 added two containers and needed none — but `up -d <service>` silently reuses
+  an old image, so check if anything Python does change.
 
 ## Open questions
+
+**All stage 12 questions are answered**, and all four live choices were decided
+in conversation rather than unilaterally: the image tag, whether to declare the
+DBRP mapping explicitly given that a virtual one already worked, whether Grafana
+gets a state volume, and the datasource's authentication shape. Each is recorded
+with its reasoning in "Visualization (stage 12)" above.
+
+**Stage 12 closed three things that had been carried as unknown:** the Grafana
+image tag and its healthcheck binary (`grafana/grafana:13.2`, and **both** `curl`
+and `wget` are present), whether an explicit DBRP mapping has to exist at all (it
+does not — a virtual one is synthesised), and what `list --json` reports for each
+kind (`"virtual": true` / `false`, which is what makes the declarer idempotent).
+
+**Nothing from stage 12 was decided without consultation.**
 
 **All stage 11 questions are answered**, and the five live choices were decided
 in conversation rather than unilaterally: the schema (measurement name, and
@@ -1528,12 +1720,17 @@ where the contract lives, how strict the type check is. None is open.
   the backoff paces it — but nothing ever escalates. Bounded retry with a
   classification of permanent-vs-transient is the hook if it is ever wanted, and
   it belongs nowhere in the current plan.
-- **Grafana image tag** — unverified, and its healthcheck with it: unknown
-  whether `curl` or `wget` exists in that image. Matters at stage 12. InfluxDB's
-  is now settled at `influxdb:2.9`, alongside `rabbitmq:4.3-management`, and
-  `curl` is confirmed present in the InfluxDB image.
-- **Optional hardening, not scheduled — now in two places.** `iot` carries the
-  RabbitMQ `administrator` tag, and `consumer_store` will hold the InfluxDB
-  **admin** token at stage 11 rather than a bucket-scoped write token. Both were
-  raised and deferred deliberately; see "One admin token" above for why a scoped
-  token cannot simply be pre-seeded the way the admin one can.
+- **Grafana image tag — CLOSED at stage 12.** `grafana/grafana:13.2`, floating
+  across patches like `influxdb:2.9` and `rabbitmq:4.3-management`. Both `curl`
+  and `wget` are in the image; `curl` is used, to match `influxdb`'s check. Kept
+  here only to record that the gap existed from stage 10 to stage 12.
+- **Optional hardening, not scheduled — now in three places.** `iot` carries the
+  RabbitMQ `administrator` tag; `consumer_store` holds the InfluxDB **admin**
+  token rather than a bucket-scoped write token; and from stage 12 **Grafana
+  holds that same admin token** to do nothing but read. All three were raised and
+  deferred deliberately; see "One admin token" above for why a scoped token
+  cannot simply be pre-seeded the way the admin one can. Grafana's is the
+  easiest of the three to narrow if it is ever wanted — a read-scoped token
+  created by one CLI call, dropped into `.env`, no code touched — and it is also
+  the widest gap, since a read-only client is holding a credential that can
+  write and delete.

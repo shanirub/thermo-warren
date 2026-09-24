@@ -1,17 +1,22 @@
-# Broker, storage, publisher and both consumers. The Python service set has
-# been stable since stage 6; stages 7-9 changed queue arguments and consumer
-# behaviour, not this file. InfluxDB arrived at stage 10, Grafana at stage 12.
+# Broker, storage, visualization, publisher, both consumers and two one-shot
+# declarers. The Python service set has been stable since stage 6; stages 7-9
+# changed queue arguments and consumer behaviour, not this file. InfluxDB
+# arrived at stage 10, Grafana and `dbrp` at stage 12.
 #
-# Expected steady state: rabbitmq Up (healthy), influxdb Up (healthy), and
-# publisher, consumer-observe and consumer-store all Up. Only `topology` exits
-# -- Exited (0), which is the one-shot declarer having done its job and is what
-# the other three gate on.
+# Expected steady state: rabbitmq, influxdb and grafana all Up (healthy), and
+# publisher, consumer-observe and consumer-store all Up. TWO services exit --
+# `topology` and `dbrp`, both Exited (0), the one-shot declarers having done
+# their jobs, which is what everything else gates on.
 #
 # Every service is written out in full, with no YAML anchors. The four Python
 # blocks differ only in `command`, so the repetition is deliberate: nothing is hidden,
 # and a service that later needs its own environment or volumes just edits its
 # own block. The cost is that `image`, `env_file`, `volumes` and RABBITMQ_HOST
 # must be kept in sync by hand.
+#
+# `dbrp` and `grafana` are the two services with NO `env_file`. They are not
+# Python, they need four keys between them, and passing those by hand keeps the
+# broker credentials out of their environments entirely.
 
 # Pinned rather than inherited from the directory name. From stage 3 this
 # prefixes named volumes holding broker and database state, so a directory
@@ -123,6 +128,99 @@ services:
       # so this covers a startup sequence rather than merely a slow boot.
       start_period: 30s
     restart: unless-stopped
+
+  # Stage 12. One-shot DBRP declarer: the same shape as `topology` below, for
+  # the database instead of the broker. Runs to completion, exits, and `grafana`
+  # gates on that exit status.
+  #
+  # Uses the server image rather than a new one -- the `influx` CLI ships inside
+  # it, so nothing extra is pulled.
+  dbrp:
+    image: influxdb:2.9
+    depends_on:
+      influxdb:
+        # Readiness, like consumer-store's gate. The CLI talks to the HTTP API,
+        # which does not listen at all during the two-phase first start.
+        condition: service_healthy
+    environment:
+      # INFLUX_-prefixed, and this is the ONLY place that is true. Stage 10 kept
+      # these names out of .env precisely because the influx CLI reads them
+      # straight from the environment, so any service inheriting `env_file: .env`
+      # would have been configured silently. This service is the one that
+      # actually wants them, so it maps them by hand from the INFLUXDB_ keys and
+      # takes no env_file at all.
+      INFLUX_HOST: http://influxdb:8086
+      INFLUX_ORG: ${INFLUXDB_ORG}
+      INFLUX_TOKEN: ${INFLUXDB_TOKEN}
+      # Read by the script itself rather than by the CLI, hence the project's
+      # own prefix here.
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+    volumes:
+      # Read-only: this is declaration, and the container has no business
+      # rewriting it.
+      - ./influxdb/dbrp.sh:/dbrp.sh:ro
+    restart: "no"
+    # The image's own entrypoint is overridden rather than relied on. It exists
+    # to run `influx setup` and then exec influxd, and what it does with an
+    # unrecognised command is not something this service should inherit.
+    entrypoint: ["/bin/sh"]
+    command: ["/dbrp.sh"]
+
+  # Stage 12. Reads what consumer_store writes.
+  grafana:
+    # Floating across patch releases, the same policy as rabbitmq:4.3-management
+    # and influxdb:2.9 above. 13.2.2 at the time of writing; Alpine-based, and
+    # both curl and wget are present, which the healthcheck below relies on.
+    image: grafana/grafana:13.2
+    depends_on:
+      dbrp:
+        # Not merely ordering. The datasource's own health check issues a query
+        # against the v1 endpoint, so the mapping has to exist before Grafana
+        # can report itself working -- the same replace-discipline-with-
+        # enforcement argument as topology's gate below.
+        condition: service_completed_successfully
+    environment:
+      # The admin UI login, compose-only forever -- no Python reads these, the
+      # same asymmetry INFLUXDB_USERNAME/_PASSWORD and RABBITMQ_VHOST carry.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USERNAME}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      # Explicit although it is the image default, so the mount below has
+      # something stated to line up with.
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # Not read by Grafana itself: these two are looked up by $VAR substitution
+      # inside the provisioning file. Note there is deliberately no
+      # `env_file: .env` on this service -- passing the four keys it needs by
+      # hand keeps the broker credentials out of Grafana's environment entirely.
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET}
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN}
+    ports:
+      # Loopback, like AMQP, management and InfluxDB. Only MQTT binds wider, and
+      # only because the ESP32 reaches it over the LAN.
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      # /api/health needs no authentication, so unlike an API call it cannot log
+      # a 401 every interval forever -- the same reasoning as influxdb's /health
+      # above. curl is in the image; nothing is installed for this.
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      # Single-phase start, unlike influxdb's, so this covers a slow boot only.
+      start_period: 15s
+    restart: unless-stopped
+
+  # NOTE: grafana has no `volumes:` entry for its own state, deliberately.
+  # Grafana keeps users, preferences and UI-created dashboards in
+  # /var/lib/grafana/grafana.db, and everything this project needs from Grafana
+  # is provisioned from files instead -- the datasource at stage 12, the
+  # dashboard at stage 13. Leaving the state in the container's writable layer
+  # means every `docker compose down` starts the next boot from an empty
+  # database, so a datasource that is present afterwards can only have come from
+  # provisioning. A named volume would make that check prove nothing. The cost,
+  # accepted: panel edits made in the UI and Explore history are scratch and do
+  # not survive `down`. They do survive `stop` and `restart`.
 
   # --------------------------------------------------------------- Python ---
   # One-shot declarer. Runs to completion and exits; every other Python service

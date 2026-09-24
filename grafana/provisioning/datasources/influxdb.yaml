@@ -1,0 +1,59 @@
+# Stage 12. Grafana reads this on every start, before serving any request, so
+# the datasource exists without anyone opening the UI. That is the whole point
+# of the stage: configuration in version control, not clicked in.
+#
+# The `grafana` service has NO named volume, deliberately. Grafana keeps its
+# state in /var/lib/grafana/grafana.db, and if that survived a `docker compose
+# down` then a datasource still being present after a restart would prove
+# nothing. With no volume, every start begins from an empty database, so a
+# working datasource can only have come from this file.
+
+apiVersion: 1
+
+datasources:
+  - name: InfluxDB
+    # Pinned rather than generated. Stage 13's dashboard JSON references the
+    # datasource by uid, and a generated one would change on every recreate --
+    # which, with no volume, is every `up`.
+    uid: influxdb-telemetry
+    type: influxdb
+
+    # Grafana's backend makes the query and the browser never talks to InfluxDB
+    # directly. That is why 8086 can stay bound to 127.0.0.1: the only client is
+    # on the compose network. `direct` would require exposing 8086 to the LAN
+    # and would leak the token to every browser that loads a dashboard.
+    access: proxy
+    url: http://influxdb:8086
+
+    # The only datasource there is; stated rather than left for Grafana to infer
+    # from being the sole entry.
+    isDefault: true
+
+    jsonData:
+      # Explicit although InfluxQL is this datasource's default. Flux would work
+      # against 2.x too, but InfluxQL is the locked decision -- it survives a
+      # move to InfluxDB 3.
+      version: InfluxQL
+
+      # The DBRP database name, which the `dbrp` one-shot declares. NOT the
+      # measurement: that is `readings`, and it appears in the FROM clause of a
+      # query, never here. The two words are deliberately different so
+      # `FROM readings` in database `telemetry` never reads as `FROM telemetry`.
+      dbName: $INFLUXDB_BUCKET
+
+      # Explicit although it is the default. POST becomes necessary only if a
+      # query outgrows the URL length limit, which a two-field SELECT will not.
+      httpMode: GET
+
+      # InfluxDB 2.x takes a token in an Authorization header, not the username
+      # and password pair a 1.x server expects, so the credential goes in as a
+      # custom header rather than in the datasource's user/password fields.
+      httpHeaderName1: Authorization
+
+    secureJsonData:
+      # $VAR lookup works in provisioning files including secureJsonData, so the
+      # token stays in .env and never enters the repository. Grafana treats any
+      # text after a `$` as a variable name, which would corrupt a value
+      # containing one -- INFLUXDB_TOKEN is hex rather than base64 (a stage 10
+      # decision, taken for .env quoting) so it cannot contain `$`, `/` or `+`.
+      httpHeaderValue1: Token $INFLUXDB_TOKEN

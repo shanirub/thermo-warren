@@ -28,11 +28,13 @@ change). Confirming it means one outage longer than 120 s showing **no**
 old 120 s fuse, so its absence is the test.
 
 Stage 17's stated DoD ("the dashboard shows real room temperature") is **not
-reachable yet**, but it is closer than it was. The software track is at stage 11,
-so **this board's readings are now stored in InfluxDB** — `esp32c3-01` is a live
-series alongside `sim-01`, with its own independent `seq`. What is still missing
-is Grafana (stage 12) and the dashboard itself (stage 13). Sign that half off
-when the software track reaches stage 13; do not quietly redefine it.
+reachable yet**, but only one thing is now missing. The software track is at
+stage 12, so **this board's readings are stored in InfluxDB and reachable from
+Grafana** — `esp32c3-01` is a live series alongside `sim-01` with its own
+independent `seq`, and a stage 12 query through Grafana's datasource counted
+12848 of its points against the simulator's 13187 over 24 h. What is still
+missing is the dashboard itself (stage 13). Sign that half off when the software
+track reaches stage 13; do not quietly redefine it.
 
 **Nothing in the firmware had to change for the storage write to work.** The
 payload contract held exactly as frozen at stage 5, which is what building the
