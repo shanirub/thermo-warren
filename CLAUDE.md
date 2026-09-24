@@ -8,27 +8,22 @@ guarantees; a durable path stores them, an observation path is lossy by design.
 between "gets the pipeline working faster" and "makes broker behaviour visible",
 choose the second. This is not a project optimising for shipping speed.
 
-## Current state — two tracks, no longer independent
+## Current state — both tracks done, one stage left
 
-The plan has a software half (stages 1–13) and a hardware half (14–18). They run
-in parallel and meet only at the payload contract. **There is no single "current
-stage"; a scalar marker cannot describe two tracks.**
+The plan had a software half (stages 1–13) and a hardware half (14–18), run in
+parallel and meeting only at the payload contract. **Both halves are now
+complete.** The two-track bookkeeping is over: stage 18 is the only stage left,
+it needs both halves, and it is the single current stage.
 
 | Track | State |
 |---|---|
-| **Software** | **Stage 12** — Grafana reads the pipeline back. Its datasource is provisioned from `grafana/provisioning/`, and a one-shot `dbrp` service declares the InfluxQL database. Underneath: `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
-| **Hardware** | **Stage 17** — MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. The firmware half of stage 17 is complete; the stage's DoD also needs a dashboard, which waits on the software track. |
+| **Software** | **Stage 13 — done, the track is finished.** A dashboard provisioned from a file: temperature and humidity, one series per device, 15 minutes at a 5 s refresh, uid `telemetry-live`. Grafana reads the pipeline back. Its datasource is provisioned from `grafana/provisioning/`, and a one-shot `dbrp` service declares the InfluxQL database. Underneath: `consumer_store` writes to InfluxDB between the parse and the ack, so the pipeline is at-least-once end to end. Measurement `readings`, `device` the only tag. A failed write retries three times and then requeues; it never dead-letters, so `telemetry.dlq` still means "failed the payload contract" and nothing else. All three dead-letter triggers were demonstrated at stages 7-9. |
+| **Hardware** | **Stage 17 — done.** MQTT 5 publisher, SNTP, a chosen outage policy and an OLED link icon, all verified on hardware. **The DoD's second half is signed off**: the stage 13 dashboard renders `esp32c3-01` alongside `sim-01`, and no firmware rework was needed for it. |
 
-**The two tracks have now met, and the parallelism ends here.** Hardware is done
-through stage 17; stage 18 (end-to-end resilience) is the first stage that needs
-*both* halves, so it cannot start until software reaches stage 13. There is no
-independent hardware work left to schedule.
-
-Next: **stage 13** on the software track — temperature and humidity panels on a
-short time range with a fast refresh, provisioned as a dashboard file rather
-than saved from the UI, since Grafana has no state volume. Stage 17's own DoD
-gets its second half signed off when stage 13 lands — the MCU side is already
-proven and needs no rework for it. Stage 18 then needs both halves.
+Next: **stage 18**, end-to-end resilience. It is the first stage that builds
+nothing — the pipeline is broken deliberately and watched, with the stage 13
+dashboard as the instrument. What to have in hand before starting is recorded
+under "Check first at stage 18" in `src/telemetry/CLAUDE.md`.
 
 **The DBRP mapping did not have to be created.** InfluxDB 2.x synthesises a
 read-only virtual one for any bucket without an explicit mapping, and InfluxQL
@@ -55,13 +50,15 @@ of stages not yet planned.**
 | Path | Contents |
 |---|---|
 | `src/telemetry/` | Python: publisher, consumers, topology, shared AMQP and storage plumbing, config — see `src/telemetry/CLAUDE.md` |
-| `firmware/` | ESP-IDF project for the ESP32-C3 — see `firmware/CLAUDE.md` |
+| `firmware/` | ESP-IDF project for the ESP32-C3, with `docs/` for the driver API, diagrams and a photo of the assembled node — see `firmware/CLAUDE.md` |
 | `tests/` | pytest, **no broker and no database required** — keep it that way |
 | `rabbitmq/` | broker config and enabled plugins; an unknown key aborts startup |
 | `grafana/provisioning/` | datasource (stage 12) and dashboard (stage 13), read-mounted; Grafana keeps no state of its own |
 | `influxdb/dbrp.sh` | one-shot declarer for the InfluxQL database mapping |
 | `compose.yaml` | RabbitMQ, InfluxDB, Grafana, publisher, consumers, two one-shot declarers |
 | `mcu-rabbitmq-staged-plan.md` | The 18-stage plan, with per-stage Definitions of Done |
+| `docs/verification-log.md` | How every stage was checked, newest first — the commands, moved out of `README.md` at stage 13 |
+| `src/telemetry/docs/` | The stage 13 dashboard image |
 
 ## These CLAUDE.md files are the decision record
 
@@ -76,6 +73,19 @@ environment. A decision that exists only in a chat transcript is lost.
 
 Keep entries compact and written as current-state reference, not as narrative.
 "Why" matters; "what we tried third" usually does not.
+
+**Three documents, three jobs**, settled at stage 13 when the README's
+verification sections were moved to `docs/verification-log.md`:
+
+| Document | Holds |
+|---|---|
+| `mcu-rabbitmq-staged-plan.md` | each stage's Definition of Done — what "done" means before the work starts |
+| `CLAUDE.md`, one per directory | what was verified, what it proved, what was decided. **The decision record** |
+| `docs/verification-log.md` | how to re-run it: the commands, newest stage first |
+
+The split is what stops any one of them growing without bound. The README had
+become an append-only log ten times the length of the page it was appended to;
+the verification log is allowed to grow that way, because that is all it is.
 
 **Settled decisions stay settled.** Anything recorded here is not to be
 re-opened, re-litigated or re-searched. If something looks wrong, say so and
